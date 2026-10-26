@@ -16,6 +16,16 @@ billion-context = "0.1"
 The default build has **zero dependencies**. `serde` and a real BPE tokenizer
 are opt-in features.
 
+| Feature | Adds | What it buys |
+| --- | --- | --- |
+| *(none)* | — | The whole kernel: refs, blocks, folding, nudge, reconciliation |
+| `serde` | `serde`, `serde_json` | `Serialize`/`Deserialize` on `State`, `Block`, `Config`, `RefMap`; enables the `persist` module (`to_json` / `from_json` / `save` / `load`, versioned and written atomically) |
+| `hf-tokenizer` | `tokenizers`, `deepseek-recipe-encoding` | Exact counting from a `tokenizer.json` instead of the character heuristic |
+
+```toml
+billion-context = { version = "0.1", features = ["serde"] }
+```
+
 ## The shape of it
 
 Three ideas carry the whole design.

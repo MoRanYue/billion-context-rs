@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every combination, because 0.1.0 shipped a `serde` feature that had
+        # never been compiled. `default` alone does not prove a feature works.
+        features:
+          - ""
+          - "serde"
+          - "hf-tokenizer"
+          - "serde,hf-tokenizer"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The hf-tokenizer tests skip themselves when the vocabulary is absent, so
+      # a download failure degrades to a compile check instead of a red build.
+      - name: Fetch tokenizer vocabulary
+        continue-on-error: true
+        run: |
+          mkdir -p assets
+          curl -fsSL --max-time 180 -o assets/tokenizer.json \
+            https://raw.githubusercontent.com/deepseek-ai/deepseek-recipe/main/static/tokenizers/v4/tokenizer.json
+
+      - name: Test
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --workspace
+          else
+            cargo test --workspace --features "${{ matrix.features }}"
+          fi
+
+      - name: Clippy
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy --workspace --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi

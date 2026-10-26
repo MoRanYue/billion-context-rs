@@ -43,6 +43,7 @@ pub struct Block {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RefEntry {
     Assigned(MsgRef),
     /// Hard-protected: never advertised, never foldable by ref.
@@ -55,6 +56,7 @@ pub enum RefEntry {
 /// map for `highestUsedIndex` on every turn; keeping it here turns an O(n) pass
 /// into O(1) and makes the monotonicity invariant local to `allocate`.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RefMap {
     pub(crate) by_raw: HashMap<MessageId, RefEntry>,
     pub(crate) by_ref: HashMap<MsgRef, MessageId>,
@@ -151,6 +153,7 @@ pub struct NudgeState {
 /// The whole mutable state of one conversation: serializable, clonable, and
 /// forkable. `Session::fork` is just `state.clone()`.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct State {
     pub blocks: Vec<Block>,
     pub refs: RefMap,

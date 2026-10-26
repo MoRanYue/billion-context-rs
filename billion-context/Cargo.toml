@@ -17,17 +17,24 @@ exclude = ["examples/diff_harness.rs", "examples/tok_diff.rs"]
 
 [dependencies]
 serde = { workspace = true, optional = true }
+# `persist` serialises snapshots as JSON, so the feature needs a JSON codec of
+# its own; leaving it in dev-dependencies made `--features serde` unbuildable
+# for every downstream crate.
+serde_json = { workspace = true, optional = true }
 # Only with `hf-tokenizer`: a real BPE vocabulary instead of the char heuristic.
 # Both are optional so the default build stays dependency-free.
 tokenizers = { version = "0.23", optional = true }
 deepseek-recipe-encoding = { version = "0.2", optional = true }
 
 [dev-dependencies]
+# Also a regular (optional) dependency: `persist` needs it at runtime under the
+# `serde` feature. Kept here as well because the differential examples parse
+# JSON regardless of features.
 serde_json = { workspace = true }
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_json"]
 # Exact counting from a HuggingFace `tokenizer.json`, encoded by DeepSeek's
 # `deepseek-recipe-encoding`. Costs a tokenizer stack and a multi-MB vocabulary
 # at runtime, so it is opt-in. Side effect worth knowing: that crate enables

@@ -1,4 +1,4 @@
-﻿//! Snapshot persistence.
+//! Snapshot persistence.
 //!
 //! Two rules, both learned the hard way upstream:
 //!
@@ -114,7 +114,7 @@ pub use inner::{from_json, load, save, to_json};
 mod tests {
     use super::*;
     use crate::ids::MsgRef;
-    use crate::state::{Block, Generation, Tier};
+    use crate::state::{Block, Generation, State, Tier};
 
     fn sample() -> State {
         let mut state = State::new();

@@ -45,7 +45,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "billion-context"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deepseek-recipe-encoding",
  "serde",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "billion-context-tool"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "billion-context",
  "serde_json",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "billion-context-wire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
