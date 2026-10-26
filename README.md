@@ -1,56 +1,58 @@
-﻿# billion-context-rs
+# billion-context-rs
 
 [![crates.io](https://img.shields.io/crates/v/billion-context.svg)](https://crates.io/crates/billion-context)
 [![docs.rs](https://docs.rs/billion-context/badge.svg)](https://docs.rs/billion-context)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context) 的核心机制（引用分配、折叠、3 层 LSM、nudge 节奏、跨回合去重）用 Rust 重写，供任意 Rust 程序嵌入使用。
+**English** · [简体中文](README.zh-CN.md)
 
-原项目是 TypeScript 的 ACP 代理，内核（`kernel/`，npm 包 `acp-kernel`）是框架无关的压缩引擎。这里只移植内核，不移植代理、Web 控制台、宿主适配层。
+A Rust rewrite of the core mechanism in [`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context) — ref assignment, folding, the 3-tier LSM, nudge cadence, cross-turn reconciliation — for embedding in any Rust program.
+
+The original is a TypeScript ACP proxy. Its kernel (`kernel/`, npm package `acp-kernel`) is a framework-agnostic compression engine, and that is what was ported. The proxy, the web console and the host adapters were not.
 
 ```
-billion-context/               纯引擎：消息 → 引用 → 折叠 → 恢复，零 IO、零异步、零 unsafe
-billion-context-wire/          协议层：Anthropic / OpenAI 的 wire types，与 IR 无损互转
-billion-context-tool/          工具层：把折叠/恢复包装成模型可直接调用的 tool
+billion-context/        pure engine: message → ref → fold → recover. No IO, no async, no unsafe
+billion-context-wire/   protocol layer: Anthropic / OpenAI wire types, lossless to the IR
+billion-context-tool/   tool layer: folding and retrieval as tools a model can call
 ```
 
-默认构建**零依赖**（`serde` 与真分词器都是可选 feature），无 `unsafe`（`#![forbid(unsafe_code)]`），全部同步。
+The default build has **zero dependencies** (`serde` and the real tokenizer are opt-in features), contains no `unsafe` (`#![forbid(unsafe_code)]`), and is fully synchronous.
 
-> 英文简介见 [`billion-context/README.md`](billion-context/README.md) —— crates.io 上展示的就是它。
+> Want a shorter introduction? See [`billion-context/README.md`](billion-context/README.md) — that is what crates.io shows.
 
 ---
 
-## 一、七条设计判断
+## 1. Seven design decisions
 
-这几条决定了 API 的形状，不是风格问题。
+These decide the shape of the API. They are not style choices.
 
-### 1. `Config` 是纯数据，代码走 `Policy`
+### 1.1 `Config` is plain data; behaviour lives in `Policy`
 
-TS 的 `Config` 里塞着闭包（`shouldCompress`、`isToolFoldable`…），于是它既不能序列化，也不能跨进程传。这里拆成两半：
-
-```rust
-let config = Config::new(200_000);          // 纯数据，serde 往返
-let session = Session::new(config).with_policy(MyPolicy); // 代码
-```
-
-`Policy` 的每个方法都有默认实现，宿主只覆盖真正需要的钩子。
-
-### 2. `&mut self`，没有 `Arc<Mutex<Session>>`
-
-会话状态是排他的。Rust 里把它做成 `Send` 的值，由持有者独占，而不是内部加锁——需要并发就 `fork()`（拷贝开销是几个 map + 一个短 vector）。
+The TypeScript `Config` carries closures (`shouldCompress`, `isToolFoldable`, …), which makes it neither serializable nor transportable across processes. Here it is split in two:
 
 ```rust
-let snapshot = session.fork();   // 之后互不影响
+let config = Config::new(200_000);          // plain data, serde round-trips
+let session = Session::new(config).with_policy(MyPolicy); // code
 ```
 
-### 3. 引擎不跑循环，宿主驱动
+Every `Policy` method has a default, so a host overrides only the hooks it actually needs.
 
-TS 版是 `while (round < 10) { call model; apply }`——引擎自己发请求。Rust 版把循环翻出来：
+### 1.2 `&mut self`, not `Arc<Mutex<Session>>`
+
+Session state is exclusive. In Rust that is a `Send` value owned by one holder rather than a lock inside the type — if you need concurrency, `fork()` it (a few maps and one short vector).
+
+```rust
+let snapshot = session.fork();   // independent from here on
+```
+
+### 1.3 The engine does not run the loop; the host does
+
+The TypeScript version is `while (round < 10) { call model; apply }` — the engine issues the requests itself. The Rust version turns the loop inside out:
 
 ```rust
 let mut step = engine.begin(input);
 loop {
-    let reply = llm.call(&step.messages).await?;      // 你的异步
+    let reply = llm.call(&step.messages).await?;      // your async
     match engine.resume(input, &reply.requests) {
         Next::Send(next) => step = next,
         Next::Done(turn) => break turn,
@@ -59,44 +61,44 @@ loop {
 }
 ```
 
-引擎不知道有异步、不知道有网络，也就没有 `async fn` 污染和 `dyn Future` 装箱。
+The engine knows nothing about async or the network, so there is no `async fn` bleeding into it and no boxed `dyn Future`.
 
-### 4. 失败是值，不是异常
+### 1.4 Failure is a value, not an exception
 
-批量折叠里一条 ref 过期，不能丢掉另外九条。所以返回 `Applied`，逐条报结果：
+One stale ref in a batch fold must not discard the other nine. So the result is an `Applied` that reports each range:
 
 ```rust
 pub struct Applied {
-    pub blocks: Vec<BlockId>,          // 成功的
-    pub errors: Vec<RangeError>,       // 失败的，逐条带 kind + detail
+    pub blocks: Vec<BlockId>,          // succeeded
+    pub errors: Vec<RangeError>,       // failed, each with kind + detail
     pub tokens_compressed: u32,
     pub partial: bool,
 }
 ```
 
-`RangeErrorKind` 的每个变体都带 `hint()`，直接喂回模型——这是自愈回路的一部分，不是给人看的日志。
+Every `RangeErrorKind` carries a `hint()` meant to be fed straight back to the model. That is part of the self-healing loop, not a log line for humans.
 
-### 5. 引用是 newtype，不是 `u32`
+### 1.5 Refs are newtypes, not `u32`
 
 ```rust
 MsgRef::new(1)          // Some(m00001)
 BlockId::new(1)         // Some(b1)
-MsgRef::parse("m00003") // 模型的输出也能解析
+MsgRef::parse("m00003") // parses the model's output too
 ```
 
-`MsgRef` 和 `BlockId` 都是 `1..=9_999_999` 的非零值，`m00001` / `b1` 是它们唯一的 wire 形态。编号永不复用——模型引用一个已经死掉的编号是合法的，它会得到 `UnknownRef` 提示，而不是被静默忽略。
+`MsgRef` and `BlockId` are non-zero values in `1..=9_999_999`, and `m00001` / `b1` are their only wire forms. Numbers are never reused — citing a dead ref is legal and yields an `UnknownRef` hint rather than being silently ignored.
 
-### 6. 内核不碰内容存储
+### 1.6 The kernel does not touch content storage
 
-摘要存在 `Block` 里，但**原始消息**不存——那是宿主的事（TS 版是 `ContentStore`，Rust 版是 `Retrieval` 回调给宿主）。内核只保证"摘要 → 原文"的映射能重建，怎么存由你决定：文件、SQLite、对象存储都行。
+Summaries live in `Block`, but **original messages** do not — that is the host's business (a `ContentStore` in the TypeScript version, a `Retrieval` callback here). The kernel only guarantees that "summary → original" can be rebuilt; where you store it is your call: files, SQLite, object storage.
 
-### 7. 渲染与逻辑分离
+### 1.7 Rendering is separate from logic
 
-`process_turn` 只做投影和计数；`<acp tokens="…">m00001</acp>` 这层包装由 `render` 策略控制，也可以完全关掉自己渲染。内核给出的 `Turn` 里，消息的 id 和 token 快照是权威的，字符串格式不是。
+`process_turn` only projects and counts. The `<acp tokens="…">m00001</acp>` wrapper is controlled by the `render` strategy and can be switched off entirely if you render yourself. What the kernel guarantees in a `Turn` is each message's id and token snapshot — not the string format.
 
 ---
 
-## 二、一次完整调用
+## 2. One complete call
 
 ```rust
 use billion_context::{Boundary, CharsAsTokens, CompressRequest, Config, MsgRef,
@@ -104,7 +106,7 @@ use billion_context::{Boundary, CharsAsTokens, CompressRequest, Config, MsgRef,
 
 let mut session = Session::new(Config::new(200_000)).with_estimator(CharsAsTokens);
 
-// 1. 投影：分配引用、算出可折叠区间、判断是否该提醒
+// 1. Project: assign refs, work out foldable ranges, decide whether to nudge.
 let turn = session.process_turn(TurnInput {
     messages: &history,
     token_count: estimate(&history),
@@ -112,8 +114,8 @@ let turn = session.process_turn(TurnInput {
     now: now(),
 });
 
-// 2. 模型看到了 turn.messages，可能收到 turn.nudge
-//    它回答"把 m00012-m00030 折掉，摘要如下"
+// 2. The model sees turn.messages and possibly turn.nudge. It answers
+//    "fold m00012–m00030, here is the summary".
 let applied = session.apply_compression(CompressRequest {
     ranges: vec![RequestedRange {
         start: Boundary::Message(MsgRef::new(12).unwrap()),
@@ -124,64 +126,66 @@ let applied = session.apply_compression(CompressRequest {
     now: now(),
 });
 
-// 3. 下一回合：原消息自动消失，编号保持不变
+// 3. Next turn: the originals are gone, the numbers are unchanged.
 let turn = session.process_turn(TurnInput { messages: &history, .. });
 
-// 4. 模型要看摘要原文（它引用了 b3）
+// 4. The model wants the original behind a summary (it cited b3).
 let hits = session.retrieve(&[MsgRef::new(12).unwrap()]);
 
-// 5. 或者反过来，撤销一次折叠
+// 5. Or undo a fold entirely.
 session.decompress(&[BlockId::new(3)]);
 ```
 
-### 谁来改写消息数组：`ViewMode`
+### Who rewrites the message array: `ViewMode`
 
-一次折叠意味着「m00001–m00004 现在是块 b1」，但块不是消息——总得有人把这句话变成一个消息数组。两种做法都合法，产出却不同，所以它是个显式开关而不是隐含行为：
+A fold means "m00001–m00004 is now block b1", but a block is not a message — somebody has to turn that statement into an array. Both answers are legitimate and they produce different results, so this is an explicit switch rather than hidden behaviour:
 
 ```rust
-// 默认：内核交付可直接发送的视图——覆盖的消息被丢弃，换成一条持有摘要的 carrier
+// Default: the kernel hands back a view you can send — covered messages are
+// dropped and replaced by one carrier holding the summary.
 let session = Session::new(cfg);
 
-// 或者：内核不动数组，只通过 blocks 报告覆盖关系，改写交给宿主
+// Or: the kernel leaves the array alone and only reports coverage through
+// `blocks`; rewriting is the host's job.
 let session = Session::new(cfg).with_view_mode(ViewMode::Host);
 ```
 
-`ViewMode::Host` 是上游 TS 内核的模型，此时 `turn.messages` 仍包含被折叠的原文（只是打上了 `<acp …>` 标签）。
+`ViewMode::Host` is the upstream TypeScript model: `turn.messages` still contains the folded originals (just tagged with `<acp …>`).
 
-### 无状态宿主的坑
+### The stateless-host trap
 
-宿主每回合重发整段 transcript 时，已折叠的原文会带着**新的 message id** 回来。内核靠内容指纹认领它们（`reconcile` 节点），把它们映射回原来的 id 再 prune 掉——否则压缩等于没做。这一条在 `lib.rs` 的 `resent_originals_are_reconciled_not_double_counted` 里锁死。
+A host that resends the whole transcript every turn brings already-folded originals back with **fresh message ids**. The kernel claims them by content fingerprint (the `reconcile` node), maps them to their original ids and prunes them — otherwise compression would achieve nothing. This is pinned by `resent_originals_are_reconciled_not_double_counted` in `lib.rs`.
 
-指纹只在**折叠那一刻**登记（`apply_one`），因为那时"哪些内容进了块"是确定的；对活消息建索引会把两条内容相同的活消息搞混。
+Fingerprints are registered **at the moment of folding** (`apply_one`), because that is when "which content went into the block" is certain. Indexing live messages would conflate two live messages that happen to have identical content.
 
-反过来，**从不重发折叠原件**的宿主（自己做了 surface 替换的那种）应该关掉它：
+Conversely, a host that **never** resends folded originals (because it does surface replacement itself) should turn this off:
 
 ```rust
 let session = Session::new(cfg).with_reconcile(false);
 ```
 
-它本来就没有东西可归一，而按内容归一反而有把两条内容相同的活消息并成一条的风险。`ViewMode::Host` 下这一项自动失效。
+It has nothing to reconcile, and content-based reconciliation risks merging two identical live messages into one. The switch is inert under `ViewMode::Host`.
 
 ---
 
-## 三、API 一览
+## 3. API at a glance
 
-| 类型 | 方法 | 说明 |
+| Type | Methods | Notes |
 |---|---|---|
-| `Session` | `new(Config)` / `try_new` | `try_new` 做配置校验，失败给 `Vec<ConfigError>` |
-| | `with_policy` / `with_estimator` / `with_pipeline` | 覆盖钩子、分词器、节点序列 |
-| | `process_turn(TurnInput)` | 唯一的热路径，同步、纯 |
-| | `apply_compression(CompressRequest)` | 逐条成败 |
-| | `retrieve(&[MsgRef])` / `search(&str, n)` | 摘要查询 |
-| | `decompress(&[BlockId])` | 撤销折叠，原文回到视图 |
-| | `status()` / `state()` / `fork()` | 观测与快照 |
-| `Engine` | `begin` / `resume` / `round` / `with_max_rounds` | 宿主驱动循环 |
-| `pipeline` | `default_pipeline()` / `Node` | 13 个节点，可替换 |
-| `persist` | `to_json` / `from_json` / `save` / `load` | 版本化快照，引用按 wire 形态存 |
-| `billion_context_wire` | `Message` / `Block` / `Usage` / `OpenAiUsage` | 未知字段保留、thinking 不解析、tool 参数不重序列化 |
-| `billion_context_tool` | `definitions` / `parse_compress` / `render_compress` | 模型可调用的 `acp_compress` + `acp_retrieve` |
+| `Session` | `new(Config)` / `try_new` | `try_new` validates config, returning `Vec<ConfigError>` |
+| | `with_policy` / `with_estimator` / `with_pipeline` | Override hooks, tokenizer, node sequence |
+| | `process_turn(TurnInput)` | The only hot path; synchronous, pure |
+| | `apply_compression(CompressRequest)` | Per-range success and failure |
+| | `retrieve(&[MsgRef])` / `search(&str, n)` | Summary lookup |
+| | `decompress(&[BlockId])` | Undo a fold; originals return to the view |
+| | `status()` / `state()` / `fork()` | Observation and snapshots |
+| `Engine` | `begin` / `resume` / `round` / `with_max_rounds` | Host-driven loop |
+| `pipeline` | `default_pipeline()` / `Node` | 13 nodes, replaceable |
+| `persist` | `to_json` / `from_json` / `save` / `load` | Versioned snapshot; refs stored in wire form |
+| `billion_context_wire` | `Message` / `Block` / `Usage` / `OpenAiUsage` | Unknown fields preserved, thinking not parsed, tool arguments not re-serialized |
+| `billion_context_tool` | `definitions` / `parse_compress` / `render_compress` | The model-facing `acp_compress` + `acp_retrieve` |
 
-### 节点顺序（`pipeline_order_is_pinned` 锁死）
+### Node order (pinned by `pipeline_order_is_pinned`)
 
 ```
 reconcile-live-ids → assign-refs → sync-blocks → prune → ccr-store
@@ -189,73 +193,71 @@ reconcile-live-ids → assign-refs → sync-blocks → prune → ccr-store
   → recommend → nudge-inject → emergency-truncate
 ```
 
-前三个是"记账"，中间是各种吸收/折叠，最后三个是"决策 + 注入 + 兜底"。
+The first three do bookkeeping, the middle do the absorbing and folding, the last three make decisions, inject and fall back.
 
-`absorb-*`、`crush`、`ccr-store` 在这个移植里是**有意的空实现**：它们需要模型调用或内容存储，纯内核给不了。参考配置里它们本来就 `enabled: false`，所以默认行为与上游一致；宿主实现了对应钩子再打开。
+`absorb-*`, `crush` and `ccr-store` are **deliberately empty** in this port: they need model calls or content storage, which a pure kernel cannot supply. They are `enabled: false` in the reference config anyway, so default behaviour matches upstream; turn them on once you implement the corresponding hooks.
 
-### 默认配置（与 TS 版逐值一致）
+### Default configuration (value-for-value identical to the TypeScript version)
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
-| tier2 / tier3 触发 | 1000 / 2000 tokens |
-| nudge 区间 | 45% ~ 75%，每 5 轮一次，第 15 轮起强制 |
-| 折叠门槛 | 区间 ≥ 5000 字符，摘要 50 ~ 20000 字符 |
-| 保留近期 | 3 条消息 / 5000 tokens |
-| 紧急截断 | 95% 水位，连续 3 次无效则硬截 |
-| 引用上限 | `m00001` ~ `m9999999`，`b1` ~ `b9999999` |
+| tier2 / tier3 trigger | 1000 / 2000 tokens |
+| nudge window | 45% – 75%, every 5 turns, forced from turn 15 |
+| Fold threshold | range ≥ 5000 chars, summary 50 – 20000 chars |
+| Recent kept | 3 messages / 5000 tokens |
+| Emergency truncation | 95% occupancy, hard cut after 3 consecutive failures |
+| Ref range | `m00001` – `m9999999`, `b1` – `b9999999` |
 
 ---
 
-## 四、接进 agent 循环（`billion-context-tool`）
+## 4. Wiring into an agent loop (`billion-context-tool`)
 
-模型看不到你的 `Session`，它只看到两个工具。
+The model cannot see your `Session`. It sees two tools.
 
 ```rust
 use billion_context_tool::{definitions, parse_compress, parse_retrieve, render_compress, render_retrieval};
 
-// 1. 注册工具（两个 JSON schema，直接丢给 provider）
+// 1. Register the tools — two JSON schemas, straight to the provider.
 let tools = definitions();
 
-// 2. 模型调了 acp_compress
+// 2. The model called acp_compress.
 if call.name == billion_context_tool::COMPRESS {
     match parse_compress(&call.input) {
         Ok(ranges) => {
             let applied = session.apply_compression(CompressRequest {
                 ranges, now: now(),
             });
-            // 成败一起回给模型：成功的别重折，失败的按 hint 重试
+            // Report both outcomes: don't re-fold what worked, retry what
+            // failed using its hint.
             tool_result(render_compress(&applied.blocks, &applied.errors))
         }
-        // 形状错误（ref 打错、start 在 end 后面）在本地就挡掉
+        // Shape errors (a malformed ref, start after end) are caught locally.
         Err(error) => tool_result(error.to_string()),
     }
 }
 ```
 
-两个刻意的设计：
+Two deliberate choices:
 
-- **schema 本身就是 prompt。** 折叠规则、ref 格式、摘要长度全写在 `description` 里，因为模型对工具描述的注意力远高于 4 万 token 之外的 system prompt。
-- **拒绝是指导，不是 400。** 失败区间回的是「m00099 不在当前视图里，换一个」，模型下一轮会自己改；回 HTTP 错误就是死一回合。
+- **The schema is the prompt.** Fold rules, ref format and summary length all live in the `description`, because a model attends to a tool description far more reliably than to a system prompt 40k tokens away.
+- **A refusal is guidance, not a 400.** A failed range comes back as "m00099 is not in the current view, pick another", and the model corrects itself next turn; an HTTP error costs a whole turn.
 
-## 五、精确 token 计量（可选）
+## 5. Exact token counting (optional)
 
-内核自己不做分词 —— `TokenEstimator` 是宿主必须注入的那一项能力，默认实现
-`CharsPerToken4` 只是启发式。它的误差不小，而且**误差符号随内容翻转**：
+The kernel does not tokenize. `TokenEstimator` is the one capability a host must inject, and the default, `CharsPerToken4`, is only a heuristic. Its error is large and **its sign flips with the content**:
 
-| 内容 | 真实 tokens | 启发式 | 误差 |
+| Content | Real tokens | Heuristic | Error |
 | --- | ---: | ---: | ---: |
-| 英文散文 241 字 | 45 | 61 | +35.6% |
-| 中文散文 90 字 | 58 | 85 | +46.6% |
-| 中英技术混排 140 字 | 65 | 59 | −9.2% |
-| Rust 代码 273 字 | 101 | 69 | −31.7% |
-| JSON 168 字 | 67 | 42 | −37.3% |
-| 工具日志 182 字 | 60 | 46 | −23.3% |
+| English prose, 241 chars | 45 | 61 | +35.6% |
+| Chinese prose, 90 chars | 58 | 85 | +46.6% |
+| Mixed Chinese/English, 140 chars | 65 | 59 | −9.2% |
+| Rust code, 273 chars | 101 | 69 | −31.7% |
+| JSON, 168 chars | 67 | 42 | −37.3% |
+| Tool log, 182 chars | 60 | 46 | −23.3% |
 
-中文实际约 **0.64 token/字**（不是 1.0），代码约 **2.7 字/token**（不是 4.0）。
-两个方向的偏差抵消不了，任何单一缩放系数都修不好。
+Chinese is really about **0.64 token/char** (not 1.0) and code about **2.7 chars/token** (not 4.0). The errors in the two directions do not cancel, so no single scale factor fixes it.
 
-需要精确值就打开 `hf-tokenizer` feature —— 它把 `deepseek-recipe-encoding`
-（DeepSeek 官方的 prompt 编码库）接到同一个 trait 上，内核一行不改：
+For exact numbers, enable the `hf-tokenizer` feature. It wires `deepseek-recipe-encoding` (DeepSeek's own prompt-encoding crate) onto the same trait without touching a line of the kernel:
 
 ```toml
 [dependencies]
@@ -265,52 +267,28 @@ billion-context = { path = "../billion-context", features = ["hf-tokenizer"] }
 ```rust
 use billion_context::tokenizer::HfTokenizer;
 
-// 词表不随 crate 发布（6 MB、归模型所有），按部署的模型取对应的那份
+// The vocabulary is not shipped with the crate (6 MB, model-owned); fetch the
+// one matching the model you deploy.
 let tokenizer = HfTokenizer::from_file("assets/tokenizer.json")?;
 let session = Session::new(Config::new(1_000_000)).with_estimator(tokenizer);
 ```
 
-**词表由你选，不写死。** `tokenizer.json` 是 HuggingFace `tokenizers` 的格式，
-主流模型家族都会发布，所以 `HfTokenizer` 对任何一份词表都成立 —— DeepSeek 只是
-它实测过的那份。DeepSeek 自己按模型家族发布、MIT 授权，在
-[`deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe) 的
-`static/tokenizers/` 下：`v4/` 对应 DeepSeek-V4-Pro，`v41/` 对应
-DeepSeek-V4-Flash-Vision-Exp。
+**The vocabulary is yours to pick; nothing is hardcoded.** `tokenizer.json` is the HuggingFace `tokenizers` format, published by every major model family, so `HfTokenizer` works with any of them — DeepSeek is merely the one it was measured against. DeepSeek publishes them per model family under MIT in [`deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe) `static/tokenizers/`: `v4/` is DeepSeek-V4-Pro, `v41/` is DeepSeek-V4-Flash-Vision-Exp.
 
-四点要注意：
+Four things to know:
 
-- **词表必须匹配实际服务的模型。** 拿错词表对某些内容比启发式还差，所以这是
-  部署决策，不该做进内核默认值。
-- **它只让「文本 → token」精确，不让「消息 → prompt」精确。** 内核逐条计数再
-  求和，而模板的 role 标记、工具定义 schema、渲染出来的 `<acp …>` 标签都不属于
-  任何一条消息的正文。这部分是几百到几千 token 的固定开销：在 1M 窗口里是噪声，
-  在 128k 窗口里是几个百分点。
-- **代价**：`tokenizers` 会带进 `hf-hub`/`ureq`/`rustls`/`esaxx-rs`，冷编译约
-  22 s，二进制增加数 MB。所以它是 `billion-context` 的一个**可选 feature**：默认构建
-  一个依赖都不加，`cargo test` 也不碰它。
-- **有一个全局副作用**：`deepseek-recipe-encoding` 打开了
-  `serde_json/preserve_order`，而 Cargo feature 是全局相加的 —— 开这个 feature
-  会把你整个依赖图里 `serde_json::Value` 的 map 从 `BTreeMap` 换成 `IndexMap`。
-  通常无害，但如果有代码依赖 `Value` 会重排键（或依赖那个更小的 map），行为会变。
-  这也是 `billion-context-wire` 那条 `value_round_trip_reorders_keys_and_changes_bytes`
-  用例在开 feature 后会打印 skip 而不是通过的原因：重排风险消失了，不是被修好了。
-  介意这点就跳过这个 feature，直接基于 `tokenizers` 自己实现 `TokenEstimator`
-  —— 计数文本时两条路结果一致，而 `tokenizers` 不动 `serde_json`。
+- **The vocabulary must match the model you actually serve.** The wrong one is worse than the heuristic on some content, so this is a deployment decision and should not be baked into a kernel default.
+- **It makes "text → tokens" exact, not "messages → prompt".** The kernel counts each message and sums, while the template's role markers, the tool definition schemas and the rendered `<acp …>` tags belong to no message body. That is a few hundred to a few thousand tokens of fixed overhead: noise in a 1M window, a few percent in 128k.
+- **Cost**: `tokenizers` pulls in `hf-hub` / `ureq` / `rustls` / `esaxx-rs`, roughly 22 s of cold compile and several MB of binary. Hence an **optional feature**: the default build adds no dependency at all, and `cargo test` never touches it.
+- **There is a global side effect.** `deepseek-recipe-encoding` enables `serde_json/preserve_order`, and Cargo features are additive across the graph — enabling it switches `serde_json::Value`'s map from `BTreeMap` to `IndexMap` for your entire dependency tree. Usually harmless, but code that relies on `Value` reordering keys (or on the smaller map) will behave differently. That is also why `billion-context-wire`'s `value_round_trip_reorders_keys_and_changes_bytes` case prints *skip* rather than *pass* with the feature on: the reordering risk is gone, not fixed. If that bothers you, skip the feature and implement `TokenEstimator` directly on `tokenizers` — the counts agree, and `tokenizers` leaves `serde_json` alone.
 
-计数本身有缓存：每条消息在**第一次分到 ref 时**计一次，写进
-`state.token_snapshot` 后不再重算（重算会让渲染出来的标签字节变化，把上游前缀
-缓存打掉）。所以精确分词器每轮只为**新消息**付钱 —— 实测 865 ns/token，
-一条 4k token 的新消息约 3.5 ms。
+Counting is cached: each message is counted **once, when it first gets a ref**, and written into `state.token_snapshot` and never recomputed (recomputing would change the rendered tag bytes and invalidate the upstream prefix cache). So an exact tokenizer only charges you for **new messages** — measured at 865 ns/token, about 3.5 ms for a new 4k-token message.
 
-这个缓存也意味着**换分词器是一次迁移**：`token_snapshot` 随状态一起持久化，
-老消息的旧计数不会因为换了 estimator 而重算。真要中途切换，得清空已存的
-`token_snapshot`（或整体重算一遍），否则同一份状态里会混着两种口径。
+That cache also means **switching tokenizers is a migration**: `token_snapshot` is persisted with the state, so old messages keep their old counts. To switch mid-flight you must clear the stored `token_snapshot` (or recompute it), or one state will mix two conventions.
 
-### 自己实现 TokenEstimator
+### Implementing `TokenEstimator` yourself
 
-`TokenEstimator` 是一个方法的 trait，十几行就能实现。用别的技术栈计数
-（`tiktoken-rs`、sentencepiece 绑定、你为了别的目的已经持有的分词器）就直接实现
-它，完全不碰 `hf-tokenizer`：
+`TokenEstimator` is a one-method trait, a dozen lines to implement. If you already count tokens some other way (`tiktoken-rs`, sentencepiece bindings, a tokenizer you hold for other reasons), implement it directly and ignore `hf-tokenizer`:
 
 ```rust
 use billion_context::{Config, Session, TokenEstimator};
@@ -327,79 +305,65 @@ let session = Session::new(Config::new(128_000))
     .with_estimator(TiktokenEstimator { bpe });
 ```
 
-`with_estimator` 收 `impl TokenEstimator`，而下面几种形状内核已经替你实现了，
-不用自己包一层：
+`with_estimator` takes `impl TokenEstimator`, and the kernel already implements it for these shapes, so you do not need a wrapper:
 
-| 你手里有 | 直接传 |
+| You have | Pass |
 | --- | --- |
-| 具体类型 | `with_estimator(MyEstimator)` |
-| `Arc<dyn TokenEstimator>` | 同上（已 `impl TokenEstimator for Arc<T>`） |
-| `Box<dyn TokenEstimator>` | 同上 |
-| 一个闭包 | `with_estimator(FnEstimator(\|t: &str\| ...))` |
+| A concrete type | `with_estimator(MyEstimator)` |
+| `Arc<dyn TokenEstimator>` | the same (`impl TokenEstimator for Arc<T>` exists) |
+| `Box<dyn TokenEstimator>` | the same |
+| A closure | `with_estimator(FnEstimator(\|t: &str\| ...))` |
 
-闭包要 `FnEstimator` 包一层、而不是裸 `impl Fn` blanket impl，是因为 `Arc<F>` 和
-`Box<F>` 自己也实现了 `Fn` —— 裸 blanket impl 会和上面两个实现重叠，直接过不了
-coherence。
+A closure needs the `FnEstimator` newtype rather than a blanket `impl Fn`: `Arc<F>` and `Box<F>` also implement `Fn`, so a bare blanket impl overlaps the two above and fails coherence.
 
-## 六、验证
+## 6. Verification
 
 ```
-cargo test                                        # 52：31 + 4 + 10 + 5 + 2 doctest
-cargo test --features hf-tokenizer                # 59：再加 5 个分词用例与 2 个 doctest
-cargo run --example basic                         # 完整走一遍
-cargo clippy --all-targets                        # 无警告（两种配置都跑）
+cargo test                                        # 52: 31 + 4 + 10 + 5 + 2 doctests
+cargo test --features hf-tokenizer                # 59: plus 5 tokenizer cases and 2 doctests
+cargo run --example basic                         # a full pass
+cargo clippy --all-targets                        # no warnings (both configurations)
 ```
 
-精确分词的那 5 个用例需要词表，缺了就自动跳过并打印一行提示：
+The five exact-tokenizer cases need a vocabulary; without one they skip and print a note:
 
 ```
-cd billion-context && ..\assets\fetch-tokenizer.ps1      # 拉 6 MB 词表到 assets/
+cd billion-context && ..\assets\fetch-tokenizer.ps1      # fetch the 6 MB vocabulary into assets/
 ```
 
 
-测试覆盖的是机制本身，不是覆盖率：编号不复用、折叠后原文消失而编号存活、重发的原文被认领而不是重复计入、reasoning 块逐字节不变、部分失败保住成功的部分、轮数上限能终止固执的模型、工具参数里打错的 ref 能被指到具体字段。
+The tests cover the mechanism, not coverage: refs are never reused, folding removes originals while numbers survive, resent originals are claimed rather than double-counted, reasoning blocks stay byte-identical, partial failure keeps what succeeded, the round cap terminates a stubborn model, and a mistyped ref inside tool arguments is reported against the specific field.
 
-### 差分测试
+### Differential testing
 
-自测只能证明「自己和自己一致」。真正的正确性基准是上游 TS 内核，所以有一套
-差分测试（`diff/`）：同一份 scenario 喂给两边，各输出同形 canonical JSON，逐字段
-diff。
+Self-tests only prove you agree with yourself. The real oracle is the upstream TypeScript kernel, so there is a differential suite (`diff/`): the same scenario into both, each emitting isomorphic canonical JSON, then a field-by-field diff.
 
 ```
-cd D:\GITHUB\billion-context
-node --import tsx D:\GITHUB\billion-context-rs\diff\run-ts.mts \
-     D:\GITHUB\billion-context-rs\diff\scenario-a.json D:\GITHUB\billion-context-rs\diff\out-ts.json
+cd path/to/billion-context
+node --import tsx path/to/billion-context-rs/diff/run-ts.mts \
+     path/to/billion-context-rs/diff/scenario-a.json path/to/billion-context-rs/diff/out-ts.json
 
-cd D:\GITHUB\billion-context-rs
-cargo run --offline -q --example diff_harness -- diff\scenario-a.json diff\out-rust.json
+cd path/to/billion-context-rs
+cargo run --offline -q --example diff_harness -- diff/scenario-a.json diff/out-rust.json
 cd diff && node compare.mjs out-ts.json out-rust.json 500
 ```
 
-当前 **0 处差异**（5 轮 `processTurn` + 2 次 `applyCompression` + `decompress` + `status`，
-含 `view` / `refs` / `blocks` / `nudge` 全部字段）。这套测试抓出了 9 个自测发现不了的
-缺陷，其中「块吸收根本没实现」「折叠后丢首条 user 消息」是纯逻辑错误。细节见
-[`diff/REPORT.md`](diff/REPORT.md)。
+Currently **0 differences** (5 `processTurn` rounds + 2 `applyCompression` calls + `decompress` + `status`, covering every field of `view` / `refs` / `blocks` / `nudge`). This suite caught 9 defects the self-tests could not, two of them outright logic errors: "block absorption was never implemented" and "folding dropped the first user message". Details in [`diff/REPORT.md`](diff/REPORT.md).
 
-分词器单独有一套，因为它引入的是**数字来源**而不是新逻辑——分歧不会崩，只会让每个
-阈值悄悄挪位：
+The tokenizer has its own suite, because what it introduces is a **source of numbers** rather than new logic — a divergence does not crash, it quietly shifts every threshold:
 
 ```
-node diff/tok-ts.mts diff/tok-ts.json                 # 语料 + TS 参考值
+node diff/tok-ts.mts diff/tok-ts.json                 # corpus + TypeScript reference values
 cargo run --example tok_diff -- diff/tok-ts.json diff/tok-rust.json
 node diff/compare-tok.mjs diff/tok-ts.json diff/tok-rust.json
 ```
 
-73 条语料（含 CJK 每个区间的边界、非 BMP 的 emoji 与 U+20000、组合字符、纯空白）
-**逐值 0 处不一致**。再往上一层，两边注入同一个合成计数器重跑整个 scenario：注入
-本身会改变 60 个字段，而两边的结果仍然 **0 处差异**——证明计数器不是只在某一处生效。
-其中一条容易踩的坑：JS 的 `text.length` 是 UTF-16 单元数，Rust 侧必须用
-`ch.len_utf16()` 累加，用 `chars().count()` 在含 emoji 的文本上直接差一倍。
+73 samples (including every CJK block boundary, non-BMP emoji and U+20000, combining marks, and pure whitespace) agree **value for value, 0 mismatches**. One level up, both sides are given the same synthetic counter and the whole scenario is replayed: the injection alone changes 60 fields, and the two sides still show **0 differences** — proving the counter is not only honoured in one place. One trap worth noting: JavaScript's `text.length` counts UTF-16 units, so the Rust side must accumulate `ch.len_utf16()`; using `chars().count()` is off by 2× on text with emoji.
 
 ---
 
-## 七、还没做的
+## 7. Not done
 
-- **异步适配**：`Engine` 已经是宿主驱动的，包一层 `async` 是薄胶水，没必要进内核。
-- **TS 版的 cache ledger**（前缀缓存账本）：属于代理层的观测逻辑，不属于压缩内核。`billion-context-wire` 里只保留了它依赖的"保序序列化"。
-- **原文存储**：`retrieve` 只返回摘要和它替换的区间；原文在宿主手里，怎么存（文件 / SQLite / 对象存储）由你决定，内核不替你选。
-
+- **Async adapters**: `Engine` is already host-driven, so wrapping it in `async` is thin glue and does not belong in the kernel.
+- **The TypeScript cache ledger** (prefix-cache accounting): that is proxy-layer observability, not compression. `billion-context-wire` keeps only the order-preserving serialization it depends on.
+- **Original-message storage**: `retrieve` returns the summary and the span it replaced; the originals are yours, and where they live (files / SQLite / object storage) is your decision, not the kernel's.
