@@ -405,6 +405,19 @@ like ordinary text. A remote URL, a provider file id, or a `document` is
 flagged: the request holds a pointer, and replacing the block with prose
 destroys the only copy of the target.
 
+This guard is advice, not a veto, and `apply_compression` does not reject a
+range that spans a hole. That is a deliberate trade: making it mandatory would
+pin every image in the transcript for the life of the session, and in a
+multi-image workload that fills the window faster than the loss it prevents. The
+kernel therefore never *suggests* a range across such a message — the ref is
+`BLOCKED` and the message is a gap — while a caller that names the range itself
+is trusted to have decided the image is expendable. Hosts that do want the veto
+can check the span before applying:
+
+```rust,ignore
+let spans_media = view[start..=end].iter().any(Message::has_unrecoverable_payload);
+```
+
 ## 8. Not done
 
 - **Async adapters**: `Engine` is already host-driven, so wrapping it in `async` is thin glue and does not belong in the kernel.

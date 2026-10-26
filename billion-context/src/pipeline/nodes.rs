@@ -470,6 +470,13 @@ impl Node for Recommend {
             // loses the image, with nothing behind `decompress` to bring it back.
             // This is a hole, not a protected message: a protected one merely
             // stays out of the range, a hole also stops the range spanning it.
+            //
+            // Advisory only, on purpose. `apply_compression` does not reject a
+            // range that spans a hole: a mandatory guard would pin every image in
+            // the transcript for the whole session, and a multi-image workload
+            // fills the window faster than the guard saves it. So this node never
+            // *suggests* such a range, and a caller that names one is assumed to
+            // have decided the image is expendable.
             if msg.has_unrecoverable_payload() {
                 gap = true;
                 continue;
