@@ -1,4 +1,4 @@
-﻿//! `billion-context-tool` — the tool-call adapter for `billion-context`.
+//! `billion-context-tool` — the tool-call adapter for `billion-context`.
 //!
 //! Two decisions are baked in here, and both come from watching models use the
 //! original TypeScript implementation:
@@ -15,21 +15,39 @@
 //!
 //! This crate holds no state, performs no IO, and does not talk to a provider.
 
-use billion_context::{BlockId, Boundary, MsgRef, RangeError, RequestedRange, Retrieval};
+use billion_context::{
+    Block, BlockId, Boundary, Hit, MsgRef, Range, RangeError, RequestedRange, Retrieval, Status,
+};
 use serde_json::{json, Value};
 
 /// Name of the folding tool. Hosts must register it under this name.
 pub const COMPRESS: &str = "acp_compress";
 /// Name of the retrieval tool.
 pub const RETRIEVE: &str = "acp_retrieve";
+/// Name of the block-restore tool.
+pub const DECOMPRESS: &str = "acp_decompress";
+/// Name of the summary-search tool.
+pub const SEARCH: &str = "acp_search";
+/// Name of the status tool.
+pub const STATUS: &str = "acp_status";
 
 // ---------------------------------------------------------------------------
 // Definitions
 // ---------------------------------------------------------------------------
 
-/// Both definitions, ready to hand to a provider.
+/// Every definition, ready to hand to a provider.
+///
+/// Five tools, because a model needs five verbs to manage its own context:
+/// fold it, look something up by ref, read a summary whole, find a summary by
+/// keyword, and see how full it is.
 pub fn definitions() -> Vec<Value> {
-    vec![compress_definition(), retrieve_definition()]
+    vec![
+        compress_definition(),
+        retrieve_definition(),
+        decompress_definition(),
+        search_definition(),
+        status_definition(),
+    ]
 }
 
 pub fn compress_definition() -> Value {
@@ -116,6 +134,77 @@ pub fn retrieve_definition() -> Value {
     })
 }
 
+pub fn decompress_definition() -> Value {
+    json!({
+        "name": DECOMPRESS,
+        "description": concat!(
+            "Read a folded span whole. Call this when a summary you can see is too ",
+            "compressed for the task in front of you — the summary is returned in ",
+            "full, not truncated. Use acp_search first if you do not know which ",
+            "block you want. This does not undo the fold: the span stays folded ",
+            "and the summary stays where it is."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["blockId"],
+            "additionalProperties": false,
+            "properties": {
+                "blockId": {
+                    "type": "string",
+                    "pattern": "^b[0-9]{1,7}$",
+                    "description": "Block to read, e.g. b5."
+                }
+            }
+        }
+    })
+}
+
+pub fn search_definition() -> Value {
+    json!({
+        "name": SEARCH,
+        "description": concat!(
+            "Find folded spans by keyword. Search the block topics and summaries ",
+            "before decompressing, so you read the right one instead of guessing ",
+            "at ids. Every whitespace-separated term scores on its own, so a few ",
+            "specific words beat a long sentence."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["query"],
+            "additionalProperties": false,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Words to look for, e.g. \"auth token refresh\"."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Maximum hits (default 5)."
+                }
+            }
+        }
+    })
+}
+
+pub fn status_definition() -> Value {
+    json!({
+        "name": STATUS,
+        "description": concat!(
+            "How full the context is, what has been folded, and which spans are ",
+            "worth folding next. Call this before a fold to find a range, and ",
+            "after one to confirm it landed. Takes no arguments."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -140,6 +229,10 @@ pub enum ToolError {
     },
     /// `end` came before `start`.
     Backwards { index: usize },
+    /// A single-argument tool was called without its argument.
+    MissingArg(&'static str),
+    /// A block id did not parse as `bN`.
+    BadBlockId(String),
 }
 
 impl std::fmt::Display for ToolError {
@@ -162,6 +255,12 @@ impl std::fmt::Display for ToolError {
             ),
             ToolError::Backwards { index } => {
                 write!(f, "entry {index}: `end` comes before `start`")
+            }
+            ToolError::MissingArg(name) => {
+                write!(f, "`{name}` is required and must be a non-empty string")
+            }
+            ToolError::BadBlockId(value) => {
+                write!(f, "`blockId` is {value:?}, which is not a block id like b3")
             }
         }
     }
@@ -245,6 +344,58 @@ pub fn parse_retrieve(args: &Value) -> Result<Vec<MsgRef>, ToolError> {
         }
     }
     Ok(out)
+}
+
+/// A parsed `search` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchArgs {
+    pub query: String,
+    pub limit: usize,
+}
+
+/// How many hits `acp_search` returns when the model does not say.
+pub const DEFAULT_SEARCH_LIMIT: usize = 5;
+
+/// Parse a `search` call. `limit` is clamped rather than rejected: a model that
+/// asks for 1000 wants "more", not an error.
+pub fn parse_search(args: &Value) -> Result<SearchArgs, ToolError> {
+    let object = args.as_object().ok_or(ToolError::NotAnObject)?;
+    let query = object
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or(ToolError::MissingArg("query"))?;
+    let limit = object
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1, 50) as usize)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT);
+    Ok(SearchArgs { query, limit })
+}
+
+/// Parse a `decompress` call. Message refs are refused on purpose: `acp_retrieve`
+/// answers "what did this message say", and accepting `m00012` here would let a
+/// model believe it had decompressed something when it had not.
+pub fn parse_decompress(args: &Value) -> Result<BlockId, ToolError> {
+    let object = args.as_object().ok_or(ToolError::NotAnObject)?;
+    let raw = object
+        .get("blockId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(ToolError::MissingArg("blockId"))?;
+    match Boundary::parse(raw) {
+        Some(Boundary::Block(id)) => Ok(id),
+        _ => Err(ToolError::BadBlockId(raw.to_string())),
+    }
+}
+
+/// `acp_status` takes no arguments. Any object is accepted, so a model that
+/// sends `{}` or an invented `{"verbose":true}` is not punished for it.
+pub fn parse_status(args: &Value) -> Result<(), ToolError> {
+    args.as_object().map(|_| ()).ok_or(ToolError::NotAnObject)
 }
 
 fn parse_boundary(
@@ -332,6 +483,114 @@ pub fn render_retrieval(hits: &[Retrieval]) -> String {
         out.push_str("\n\n");
     }
     out.truncate(out.trim_end().len());
+    out
+}
+
+/// The `tool_result` body for a `decompress` call.
+///
+/// Returns the summary in full — that is what "decompressed" means at tier 1.
+/// The original messages are deliberately not included: they live in the host's
+/// transcript, and handing them back here would re-inflate the context the model
+/// just compressed. A host that does want them can restore the block instead.
+pub fn render_decompression(block: &Block) -> String {
+    let topic = block.topic.as_deref().unwrap_or("untitled");
+    let mut out = format!("## {} — tier {:?} ({topic})\n", block.id, block.tier);
+    if let Some((start, end)) = block.span {
+        out.push_str(&format!("replaces {start}–{end}\n"));
+    }
+    if !block.direct_blocks.is_empty() {
+        let folded: Vec<String> = block.direct_blocks.iter().map(|b| b.to_string()).collect();
+        out.push_str(&format!("folds {}\n", folded.join(", ")));
+    }
+    out.push('\n');
+    out.push_str(&block.summary);
+    out
+}
+
+/// The `tool_result` body for a `search` call.
+pub fn render_search(hits: &[Hit]) -> String {
+    if hits.is_empty() {
+        return concat!(
+            "No block matched. Try fewer, broader words — every term is matched ",
+            "separately against block topics and summaries, so one rare word can ",
+            "rule out an otherwise good block."
+        )
+        .to_string();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        let topic = hit.topic.as_deref().unwrap_or("untitled");
+        out.push_str(&format!(
+            "- {} (tier {:?}, {topic}, score {:.2}): {}\n",
+            hit.block, hit.tier, hit.score, hit.snippet
+        ));
+    }
+    out.push_str("\nRead one whole with acp_decompress.");
+    out
+}
+
+/// The `tool_result` body for a `status` call.
+///
+/// `ranges` is what `process_turn` reported as compressible; pass an empty slice
+/// when the host has no fresh turn. `token_count` is the host's own count for the
+/// view it is about to send — the kernel does not track it between turns.
+pub fn render_status(status: &Status, token_count: usize, ranges: &[Range]) -> String {
+    let mut out = String::new();
+    let limit = status.model_context_limit as usize;
+    if limit > 0 {
+        let used = (100.0 * token_count as f64 / limit as f64).round() as u64;
+        out.push_str(&format!(
+            "Context: {} / {} tokens ({used}% used)\n",
+            thousands(token_count as u64),
+            thousands(limit as u64)
+        ));
+    } else {
+        out.push_str(&format!(
+            "Context: {} tokens (no window configured)\n",
+            thousands(token_count as u64)
+        ));
+    }
+    out.push_str(&format!(
+        "Folded: {} block(s) active, {} total; tier1 {}, tier2 {}, tier3 {}\n",
+        status.active_blocks,
+        status.blocks,
+        status.tiers[0],
+        status.tiers[1],
+        status.tiers[2]
+    ));
+    out.push_str(&format!(
+        "Saved: {} tokens across {} fold(s); {} refs allocated\n",
+        thousands(status.tokens_compressed),
+        status.compression_count,
+        status.refs_allocated
+    ));
+    if ranges.is_empty() {
+        out.push_str("\nNo span is worth folding right now.");
+    } else {
+        out.push_str("\nWorth folding now:\n");
+        for range in ranges {
+            out.push_str(&format!(
+                "- {}–{} ({} messages, {} tokens)\n",
+                range.start,
+                range.end,
+                range.count,
+                thousands(range.tokens as u64)
+            ));
+        }
+    }
+    out
+}
+
+/// `1234` → `1,234`, so a token count reads at a glance.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
     out
 }
 
@@ -531,5 +790,169 @@ mod tests {
             now: 3,
         });
         assert!(after.messages.len() < 6, "the folded span must disappear");
+    }
+
+    use billion_context::{CharsAsTokens, CompressRequest, Config, RenderStrategy, Session, TurnInput};
+
+    #[test]
+    fn all_five_tools_are_declared() {
+        let defs = definitions();
+        let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec![COMPRESS, RETRIEVE, DECOMPRESS, SEARCH, STATUS]
+        );
+    }
+
+    #[test]
+    fn decompress_accepts_a_block_and_refuses_a_message() {
+        assert_eq!(
+            parse_decompress(&json!({ "blockId": "b3" })).unwrap(),
+            BlockId::new(3).unwrap()
+        );
+        // A message ref belongs to acp_retrieve. Saying so is the point: a model
+        // that decompressed nothing must not believe otherwise.
+        assert_eq!(
+            parse_decompress(&json!({ "blockId": "m00012" })).unwrap_err(),
+            ToolError::BadBlockId("m00012".into())
+        );
+        assert_eq!(
+            parse_decompress(&json!({})).unwrap_err(),
+            ToolError::MissingArg("blockId")
+        );
+    }
+
+    #[test]
+    fn search_clamps_the_limit_instead_of_rejecting_it() {
+        let asked = parse_search(&json!({ "query": "auth token", "limit": 1000 })).unwrap();
+        assert_eq!(asked.limit, 50, "a huge limit means 'more', not 'error'");
+        assert_eq!(asked.query, "auth token");
+
+        let default = parse_search(&json!({ "query": "auth" })).unwrap();
+        assert_eq!(default.limit, DEFAULT_SEARCH_LIMIT);
+
+        assert_eq!(
+            parse_search(&json!({ "query": "   " })).unwrap_err(),
+            ToolError::MissingArg("query")
+        );
+    }
+
+    #[test]
+    fn status_takes_no_arguments_but_still_needs_an_object() {
+        assert!(parse_status(&json!({})).is_ok());
+        assert!(
+            parse_status(&json!({ "verbose": true })).is_ok(),
+            "an invented argument must not fail the call"
+        );
+        assert_eq!(parse_status(&json!([])).unwrap_err(), ToolError::NotAnObject);
+    }
+
+    #[test]
+    fn an_empty_search_result_says_what_to_change() {
+        let text = render_search(&[]);
+        assert!(text.contains("No block matched"));
+        assert!(text.contains("broader"));
+    }
+
+    #[test]
+    fn a_folded_block_can_be_searched_and_read_back() {
+        let mut session = Session::new(Config::new(20_000)).with_estimator(CharsAsTokens);
+        let history: Vec<_> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    billion_context::Role::User
+                } else {
+                    billion_context::Role::Assistant
+                };
+                billion_context::Message::text(
+                    format!("msg-{i}"),
+                    role,
+                    format!("{}{i}", "context ".repeat(400)),
+                )
+            })
+            .collect();
+
+        let turn = session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 3_000,
+            render: RenderStrategy::All,
+            now: 1,
+        });
+        let range = &turn.ranges[0];
+        let requests = parse_compress(&json!({ "ranges": [{
+            "start": range.start.to_string(),
+            "end": range.end.to_string(),
+            "topic": "borrow checker debate",
+            "summary": "The opening exchanges established the port's constraints and scope."
+        }] }))
+        .expect("the model's call parses");
+        let applied = session.apply_compression(CompressRequest {
+            ranges: requests,
+            now: 2,
+        });
+        assert!(applied.is_ok(), "{:?}", applied.errors);
+
+        // Multi-term: only "borrow" is in the topic, only "constraints" in the
+        // summary. A phrase search would find neither.
+        let hits = session.search("borrow constraints", 5);
+        assert_eq!(hits.len(), 1, "both terms describe the same block");
+        let text = render_search(&hits);
+        assert!(text.contains("b1"), "{text}");
+        assert!(text.contains("borrow checker debate"), "{text}");
+
+        // Read it back without expanding it.
+        let id = parse_decompress(&json!({ "blockId": "b1" })).unwrap();
+        let block = session.block(id).expect("the block exists");
+        let body = render_decompression(block);
+        assert!(body.contains("tier T1"), "{body}");
+        assert!(body.contains("replaces m00001"), "{body}");
+        assert!(body.contains("constraints and scope"), "{body}");
+        assert!(
+            !session.block(id).unwrap().expanded,
+            "reading a block must not expand it"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_saving_in_readable_numbers() {
+        let mut session = Session::new(Config::new(20_000)).with_estimator(CharsAsTokens);
+        let history: Vec<_> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    billion_context::Role::User
+                } else {
+                    billion_context::Role::Assistant
+                };
+                billion_context::Message::text(
+                    format!("msg-{i}"),
+                    role,
+                    format!("{}{i}", "context ".repeat(400)),
+                )
+            })
+            .collect();
+        let turn = session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 3_000,
+            render: RenderStrategy::All,
+            now: 1,
+        });
+
+        let status = session.status();
+        let text = render_status(&status, 3_000, &turn.ranges);
+        assert!(text.contains("3,000 / 20,000 tokens"), "{text}");
+        assert!(text.contains("15% used"), "{text}");
+        assert!(text.contains("Worth folding now"), "{text}");
+
+        let idle = render_status(&status, 0, &[]);
+        assert!(idle.contains("No span is worth folding right now"), "{idle}");
+    }
+
+    #[test]
+    fn thousands_groups_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(12_345), "12,345");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }

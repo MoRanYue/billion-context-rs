@@ -112,7 +112,10 @@ pub struct Hit {
     pub tier: Tier,
     pub topic: Option<String>,
     pub snippet: String,
-    pub score: u32,
+    /// Weighted relevance in `0.0..=1.0`. Fractional on purpose: the scoring
+    /// gives a topic hit more weight than a summary hit, so an integer count
+    /// would collapse two very different matches into the same rank.
+    pub score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -581,34 +584,59 @@ impl Session {
         }
     }
 
+    /// Keyword search over the summaries of active blocks.
+    ///
+    /// The query is split on whitespace and every term scores independently, so
+    /// `auth token refresh` finds a block that says only "refresh the token" —
+    /// a whole-phrase match would return nothing and quietly make the tool
+    /// useless. Topic hits weigh more than summary hits, each is capped so one
+    /// repeated word cannot dominate, and the total is capped at 1.
+    ///
+    /// There is deliberately no relevance floor: ranking plus the caller's
+    /// `limit` is the precision mechanism, and a floor would drop the weakest
+    /// positive signal — a single summary occurrence.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
+        let terms: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if terms.is_empty() {
             return Vec::new();
         }
+
         let mut hits: Vec<Hit> = self
             .state
             .active_blocks()
             .filter_map(|block| {
-                let haystack = format!(
-                    "{} {}",
-                    block.topic.as_deref().unwrap_or_default(),
-                    block.summary
-                )
-                .to_lowercase();
-                let score = haystack.matches(&needle).count() as u32;
-                (score > 0).then(|| Hit {
+                let score = score_relevance(block, &terms);
+                (score > 0.0).then(|| Hit {
                     block: block.id,
                     tier: block.tier,
                     topic: block.topic.clone(),
-                    snippet: snippet(&block.summary, &needle, 160),
+                    snippet: snippet(&block.summary, &terms, 160),
                     score,
                 })
             })
             .collect();
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.block.cmp(&b.block)));
+        // Stable, so equal scores keep block order and the output is
+        // reproducible for a given state.
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(limit);
         hits
+    }
+
+    /// Read one block by id.
+    ///
+    /// This is the read-only counterpart to [`Session::decompress`]: it returns
+    /// the block without expanding it, so a host answering "what does this block
+    /// say" does not silently change what the next request sends.
+    pub fn block(&self, id: BlockId) -> Option<&Block> {
+        self.state.blocks.iter().find(|block| block.id == id)
     }
 
     pub fn status(&self) -> Status {
@@ -637,10 +665,40 @@ fn boundary_label(boundary: Boundary) -> String {
     }
 }
 
-fn snippet(text: &str, needle: &str, width: usize) -> String {
+/// How well a block answers `terms`, in `0.0..=1.0`.
+///
+/// A term in the topic is worth up to 0.45 and a term in the summary up to
+/// 0.20. The asymmetry is intentional: the topic is the block's label, so a
+/// match there says the block is *about* the query, while a summary match may
+/// be incidental. Both caps stop one term that happens to repeat from
+/// outranking a block that matches every term.
+fn score_relevance(block: &Block, terms: &[String]) -> f64 {
+    let topic = block.topic.as_deref().unwrap_or_default().to_lowercase();
+    let summary = block.summary.to_lowercase();
+    let mut score = 0.0f64;
+    for term in terms {
+        let topic_hits = topic.matches(term.as_str()).count();
+        if topic_hits > 0 {
+            score += (topic_hits as f64 * 0.15).min(0.45);
+        }
+        let summary_hits = summary.matches(term.as_str()).count();
+        if summary_hits > 0 {
+            score += (summary_hits as f64 * 0.04).min(0.2);
+        }
+    }
+    score.min(1.0)
+}
+
+fn snippet(text: &str, terms: &[String], width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let lower: String = text.to_lowercase();
-    let at = lower.find(needle).unwrap_or(0);
+    // Anchor on the earliest matching term, so a snippet of a block that
+    // matches several terms starts at the first thing the query asked for.
+    let at = terms
+        .iter()
+        .filter_map(|term| lower.find(term.as_str()))
+        .min()
+        .unwrap_or(0);
     // `find` returns a byte offset; walk the chars to convert it.
     let byte_to_char = |byte: usize| lower[..byte].chars().count();
     let centre = byte_to_char(at);

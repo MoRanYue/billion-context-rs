@@ -1,4 +1,4 @@
-# billion-context-rs
+﻿# billion-context-rs
 
 [![crates.io](https://img.shields.io/crates/v/billion-context.svg)](https://crates.io/crates/billion-context)
 [![docs.rs](https://docs.rs/billion-context/badge.svg)](https://docs.rs/billion-context)
@@ -13,7 +13,7 @@ The original is a TypeScript ACP proxy. Its kernel (`kernel/`, npm package `acp-
 ```
 billion-context/        pure engine: message → ref → fold → recover. No IO, no async, no unsafe
 billion-context-wire/   protocol layer: Anthropic / OpenAI wire types, lossless to the IR
-billion-context-tool/   tool layer: folding and retrieval as tools a model can call
+billion-context-tool/   tool layer: folding, retrieval, search and status as tools a model can call
 ```
 
 The default build has **zero dependencies** (`serde` and the real tokenizer are opt-in features), contains no `unsafe` (`#![forbid(unsafe_code)]`), and is fully synchronous.
@@ -176,14 +176,14 @@ It has nothing to reconcile, and content-based reconciliation risks merging two 
 | | `with_policy` / `with_estimator` / `with_pipeline` | Override hooks, tokenizer, node sequence |
 | | `process_turn(TurnInput)` | The only hot path; synchronous, pure |
 | | `apply_compression(CompressRequest)` | Per-range success and failure |
-| | `retrieve(&[MsgRef])` / `search(&str, n)` | Summary lookup |
+| | `retrieve(&[MsgRef])` / `search(&str, n)` / `block(&BlockId)` | Read paths; none of them mutate the session |
 | | `decompress(&[BlockId])` | Undo a fold; originals return to the view |
 | | `status()` / `state()` / `fork()` | Observation and snapshots |
 | `Engine` | `begin` / `resume` / `round` / `with_max_rounds` | Host-driven loop |
 | `pipeline` | `default_pipeline()` / `Node` | 13 nodes, replaceable |
 | `persist` | `to_json` / `from_json` / `save` / `load` | Versioned snapshot; refs stored in wire form |
 | `billion_context_wire` | `Message` / `Block` / `Usage` / `OpenAiUsage` | Unknown fields preserved, thinking not parsed, tool arguments not re-serialized |
-| `billion_context_tool` | `definitions` / `parse_compress` / `render_compress` | The model-facing `acp_compress` + `acp_retrieve` |
+| `billion_context_tool` | `definitions` / `parse_*` / `render_*` | The model-facing `acp_compress`, `acp_retrieve`, `acp_decompress`, `acp_search`, `acp_status` |
 
 ### Node order (pinned by `pipeline_order_is_pinned`)
 
@@ -212,12 +212,12 @@ The first three do bookkeeping, the middle do the absorbing and folding, the las
 
 ## 4. Wiring into an agent loop (`billion-context-tool`)
 
-The model cannot see your `Session`. It sees two tools.
+The model cannot see your `Session`. It sees five tools.
 
 ```rust
-use billion_context_tool::{definitions, parse_compress, parse_retrieve, render_compress, render_retrieval};
+use billion_context_tool::{definitions, parse_compress, render_compress};
 
-// 1. Register the tools — two JSON schemas, straight to the provider.
+// 1. Register the tools — five JSON schemas, straight to the provider.
 let tools = definitions();
 
 // 2. The model called acp_compress.
@@ -237,10 +237,21 @@ if call.name == billion_context_tool::COMPRESS {
 }
 ```
 
-Two deliberate choices:
+| Tool | Purpose |
+| --- | --- |
+| `acp_compress` | Fold a span into a summary |
+| `acp_retrieve` | Read the original messages behind a ref |
+| `acp_decompress` | Read one folded block's summary in full |
+| `acp_search` | Find which block covered a topic |
+| `acp_status` | How full the context is, and what is worth folding |
+
+`acp_search` and `acp_decompress` are not conveniences — they are what makes folding rational. A model that cannot check what it folded either refuses to fold (the context grows) or folds and then invents the detail it lost. Both read paths go through `&self`, so curiosity cannot re-inflate the context: `session.block(id)` returns a block without expanding it.
+
+Three deliberate choices:
 
 - **The schema is the prompt.** Fold rules, ref format and summary length all live in the `description`, because a model attends to a tool description far more reliably than to a system prompt 40k tokens away.
 - **A refusal is guidance, not a 400.** A failed range comes back as "m00099 is not in the current view, pick another", and the model corrects itself next turn; an HTTP error costs a whole turn.
+- **Search matches terms, not a phrase.** `borrow constraints` finds a block whose topic says "borrow checker" and whose summary says "constraints"; a phrase search would find neither. `limit` is clamped rather than rejected — a model asking for 1000 wants "more", not a correction.
 
 ## 5. Exact token counting (optional)
 

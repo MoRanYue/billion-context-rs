@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.0 — 2026-10-26
+
+### Added
+
+- **`acp_decompress`, `acp_search` and `acp_status`** — the tool layer now
+  covers the whole model-facing surface of the original, not just folding.
+  Previously a model could fold a span and then had no way to look at what it
+  had folded; that asymmetry is what makes models either refuse to compress or
+  compress and then invent the detail they lost.
+
+  | Tool | Kernel call |
+  |---|---|
+  | `acp_decompress` | `Session::block` |
+  | `acp_search` | `Session::search` |
+  | `acp_status` | `Session::status` |
+
+- `Session::block(&BlockId) -> Option<&Block>` — the read-only counterpart to
+  `decompress`. Reading a block does not expand it, so a host answering
+  "what does this block say" cannot accidentally re-inflate the context.
+- `SearchArgs`, `DEFAULT_SEARCH_LIMIT`, `parse_search`, `parse_decompress`,
+  `parse_status`, `render_decompression`, `render_search`, `render_status`.
+
+### Changed
+
+- **`search` matches terms, not a phrase.** It previously matched the query as
+  one substring, so `borrow constraints` found nothing even when a block's topic
+  said "borrow checker" and its summary said "constraints". Terms are now scored
+  separately: topic hits weigh 0.15 each (capped 0.45), summary hits 0.04 each
+  (capped 0.2), total capped at 1.0.
+- `Hit::score` is `f64` rather than `u32` — the score is a weighted blend, and
+  an integer count collapsed genuinely different matches into ties.
+- `snippet` anchors on the earliest matching term instead of the first term.
+
 ## 0.1.1 — 2026-10-26
 
 ### Fixed
