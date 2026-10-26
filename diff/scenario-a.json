@@ -1,0 +1,92 @@
+{
+  "contextLimit": 100000,
+  "steps": [
+    {
+      "op": "turn",
+      "tokenCount": 20000,
+      "messages": [
+        { "id": "u1", "role": "user", "kind": "text", "text": "user question alpha ", "repeat": 180 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "assistant answer alpha ", "repeat": 160 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "user question beta ", "repeat": 180 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "assistant answer beta ", "repeat": 160 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "user question gamma ", "repeat": 180 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "assistant answer gamma ", "repeat": 160 }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 21000,
+      "messages": [
+        { "id": "u1", "role": "user", "kind": "text", "text": "user question alpha ", "repeat": 180 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "assistant answer alpha ", "repeat": 160 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "user question beta ", "repeat": 180 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "assistant answer beta ", "repeat": 160 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "user question gamma ", "repeat": 180 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "assistant answer gamma ", "repeat": 160 },
+        { "id": "u4", "role": "user", "kind": "text", "text": "user question delta ", "repeat": 180 },
+        { "id": "a4", "role": "assistant", "kind": "text", "text": "assistant answer delta ", "repeat": 160 }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u1", "role": "user", "kind": "text", "text": "user question alpha ", "repeat": 180 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "assistant answer alpha ", "repeat": 160 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "user question beta ", "repeat": 180 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "assistant answer beta ", "repeat": 160 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "user question gamma ", "repeat": 180 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "assistant answer gamma ", "repeat": 160 },
+        { "id": "u4", "role": "user", "kind": "text", "text": "user question delta ", "repeat": 180 },
+        { "id": "a4", "role": "assistant", "kind": "text", "text": "assistant answer delta ", "repeat": 160 },
+        { "id": "u5", "role": "user", "kind": "text", "text": "user question epsilon ", "repeat": 180 },
+        { "id": "a5", "role": "assistant", "kind": "text", "text": "assistant answer epsilon ", "repeat": 160 }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "m00001",
+          "endRef": "m00004",
+          "topic": "alpha-beta",
+          "summary": "The user asked two questions (alpha, beta) and the assistant answered both."
+        }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 30000,
+      "messages": [
+        { "id": "u1", "role": "user", "kind": "text", "text": "user question alpha ", "repeat": 180 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "assistant answer alpha ", "repeat": 160 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "user question beta ", "repeat": 180 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "assistant answer beta ", "repeat": 160 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "user question gamma ", "repeat": 180 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "assistant answer gamma ", "repeat": 160 },
+        { "id": "u4", "role": "user", "kind": "text", "text": "user question delta ", "repeat": 180 },
+        { "id": "a4", "role": "assistant", "kind": "text", "text": "assistant answer delta ", "repeat": 160 },
+        { "id": "u5", "role": "user", "kind": "text", "text": "user question epsilon ", "repeat": 180 },
+        { "id": "a5", "role": "assistant", "kind": "text", "text": "assistant answer epsilon ", "repeat": 160 }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 31000,
+      "messages": [
+        { "id": "u1b", "role": "user", "kind": "text", "text": "user question alpha ", "repeat": 180 },
+        { "id": "a1b", "role": "assistant", "kind": "text", "text": "assistant answer alpha ", "repeat": 160 },
+        { "id": "u2b", "role": "user", "kind": "text", "text": "user question beta ", "repeat": 180 },
+        { "id": "a2b", "role": "assistant", "kind": "text", "text": "assistant answer beta ", "repeat": 160 },
+        { "id": "u3b", "role": "user", "kind": "text", "text": "user question gamma ", "repeat": 180 },
+        { "id": "a3b", "role": "assistant", "kind": "text", "text": "assistant answer gamma ", "repeat": 160 },
+        { "id": "u4b", "role": "user", "kind": "text", "text": "user question delta ", "repeat": 180 },
+        { "id": "a4b", "role": "assistant", "kind": "text", "text": "assistant answer delta ", "repeat": 160 },
+        { "id": "u5b", "role": "user", "kind": "text", "text": "user question epsilon ", "repeat": 180 },
+        { "id": "a5b", "role": "assistant", "kind": "text", "text": "assistant answer epsilon ", "repeat": 160 }
+      ]
+    },
+    { "op": "decompress", "blocks": ["b1"] },
+    { "op": "status" }
+  ]
+}

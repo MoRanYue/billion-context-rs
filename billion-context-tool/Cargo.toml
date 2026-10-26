@@ -1,0 +1,17 @@
+[package]
+name = "billion-context-tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Tool-call adapter: exposes billion-context's fold and retrieve to a model"
+keywords = ["llm", "tool-calling", "agent", "context", "compression"]
+categories = ["api-bindings", "text-processing"]
+readme = "README.md"
+
+[dependencies]
+billion-context = { version = "0.1.0", path = "../billion-context" }
+serde_json = "1"
