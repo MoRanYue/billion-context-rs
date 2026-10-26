@@ -79,7 +79,8 @@ impl Engine {
     }
 
     /// First projection of the turn. Always yields something to send: the model
-    /// may simply answer, in which case the host calls [`Engine::finish`].
+    /// may simply answer, in which case the host calls [`Engine::resume`] with
+    /// no compression requests.
     pub fn begin(&mut self, input: TurnInput<'_>) -> Step {
         let turn = self.session.process_turn(input);
         self.round = 1;

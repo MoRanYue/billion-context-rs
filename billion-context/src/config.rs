@@ -1,4 +1,4 @@
-﻿//! Configuration (pure data) and the host hooks (code).
+//! Configuration (pure data) and the host hooks (code).
 //!
 //! Splitting these is the main structural change from the TS kernel, where
 //! `Config` carries closures and therefore cannot be serialized, shipped, or
@@ -262,9 +262,8 @@ pub trait TokenEstimator: Send + Sync + 'static {
 /// content: Chinese prose costs ~0.64 tokens per character (so this
 /// overestimates it by ~47%), source code ~2.7 characters per token (so this
 /// underestimates it by ~32%). No single scale factor repairs that. Hosts that
-/// need the real number inject their own [`TokenEstimator`] — see
-/// [`crate::tokenizer`] for the ready-made one behind the `hf-tokenizer`
-/// feature.
+/// need the real number inject their own [`TokenEstimator`] — see the
+/// `tokenizer` module for the ready-made one behind the `hf-tokenizer` feature.
 pub struct CharsPerToken4;
 
 impl TokenEstimator for CharsPerToken4 {

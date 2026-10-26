@@ -734,6 +734,45 @@ mod tests {
     }
 
     #[test]
+    fn media_without_bytes_is_a_hole_no_range_can_span() {
+        let mut s = session();
+        let mut msgs = conversation(8, 6_000);
+        // An image the host cannot restore, sitting in the middle of the
+        // otherwise foldable span. Folding it would keep the prose and lose the
+        // picture, with nothing behind `decompress` to bring it back.
+        msgs[3] = msgs[3].clone().with_unrecoverable_payload(true);
+
+        let turn = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 100,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let hole = MsgRef::new(4).expect("ref");
+        assert!(
+            !turn.ranges.is_empty(),
+            "the text around the image is still foldable"
+        );
+        for range in &turn.ranges {
+            assert!(
+                !(range.start <= hole && hole <= range.end),
+                "range {}-{} spans the un-restorable image",
+                range.start.index(),
+                range.end.index()
+            );
+        }
+        assert!(
+            turn.ranges.iter().any(|r| r.end < hole),
+            "content before the image is still offered"
+        );
+        assert!(
+            turn.ranges.iter().any(|r| r.start > hole),
+            "content after the image is still offered"
+        );
+    }
+
+    #[test]
     fn refs_are_assigned_and_never_reused() {
         let mut s = session();
         let msgs = conversation(3, 10);

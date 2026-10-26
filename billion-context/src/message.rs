@@ -166,6 +166,24 @@ pub struct Message {
     /// Set by the host when this message is the host's own rendered summary of
     /// an active block, so a plain message range must not fold it again.
     pub summary_of_block: Option<crate::ids::BlockId>,
+    /// Set by the host when this message carries payload the host cannot hand
+    /// back after a fold — a remote-URL image, a provider file reference, a
+    /// document.
+    ///
+    /// The engine folds *text*, and a summary is text. Once an image block has
+    /// been replaced by its prose description there is nothing behind
+    /// `decompress` to restore it: the block is text, the bytes are gone. So a
+    /// message flagged here is a **hard hole** in the transcript — no
+    /// recommended range may span it (`recommend.rs`).
+    ///
+    /// The host decides this, because only the host sees the provider's wire
+    /// form. `billion-context-wire` answers the Anthropic half for you with
+    /// [`Block::has_unrecoverable_payload`]; the core deliberately keeps no
+    /// provider knowledge.
+    ///
+    /// [`Block::has_unrecoverable_payload`]: https://docs.rs/billion-context-wire
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unrecoverable_payload: bool,
 }
 
 impl Message {
@@ -176,7 +194,29 @@ impl Message {
             content,
             thinking_tokens: 0,
             summary_of_block: None,
+            unrecoverable_payload: false,
         }
+    }
+
+    /// Mark this message as carrying payload that cannot be restored after a
+    /// fold. See [`Message::unrecoverable_payload`].
+    ///
+    /// ```no_run
+    /// use billion_context::{Content, Message, Role};
+    /// let msg = Message::text("a1", Role::User, "look at this")
+    ///     .with_unrecoverable_payload(true);
+    /// assert!(msg.has_unrecoverable_payload());
+    /// ```
+    #[must_use]
+    pub fn with_unrecoverable_payload(mut self, yes: bool) -> Self {
+        self.unrecoverable_payload = yes;
+        self
+    }
+
+    /// Whether folding this message would destroy bytes the host cannot give
+    /// back. The recommender refuses to let any range span such a message.
+    pub fn has_unrecoverable_payload(&self) -> bool {
+        self.unrecoverable_payload
     }
 
     pub fn text(id: impl AsRef<str>, role: Role, text: impl AsRef<str>) -> Self {

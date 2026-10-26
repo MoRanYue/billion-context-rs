@@ -1,4 +1,4 @@
-﻿# billion-context-rs
+# billion-context-rs
 
 [![crates.io](https://img.shields.io/crates/v/billion-context.svg)](https://crates.io/crates/billion-context)
 [![docs.rs](https://docs.rs/billion-context/badge.svg)](https://docs.rs/billion-context)
@@ -373,7 +373,39 @@ node diff/compare-tok.mjs diff/tok-ts.json diff/tok-rust.json
 
 ---
 
-## 7. Not done
+## 7. What a fold never touches
+
+A fold replaces text with a summary. For text that is lossy-but-recoverable —
+the originals are still in `decompress`. For a few things it is **not**
+recoverable, and the recommender treats those as hard holes: no suggested range
+may span one.
+
+| Guard | Protects |
+|---|---|
+| recent tail (`preserve_recent_messages`, `preserve_recent_tokens`) | what the model is working on right now |
+| last user turn | the intent being answered |
+| tool call ⇄ result pairing | a fold that keeps a call and swallows its result (the provider rejects the turn) |
+| reasoning ⇄ burst pairing | a rebuilt request whose thinking block lost the calls it justifies |
+| **media with no inline bytes** | images, documents and file references whose payload only the provider holds |
+
+The last one is the host's call, because only the host sees the wire form.
+`billion-context-wire` answers the Anthropic half:
+
+```rust,ignore
+let msg: billion_context_wire::Message = serde_json::from_str(raw)?;
+let carries_bytes = msg.has_unrecoverable_payload();
+
+let msg = billion_context::Message::text(id, Role::User, text)
+    .with_unrecoverable_payload(carries_bytes);   // now a hole in the transcript
+```
+
+Inline `base64` and `data:` URLs are **not** flagged: their bytes are in the
+message, so a host that spilled them to disk can restore them, and they fold
+like ordinary text. A remote URL, a provider file id, or a `document` is
+flagged: the request holds a pointer, and replacing the block with prose
+destroys the only copy of the target.
+
+## 8. Not done
 
 - **Async adapters**: `Engine` is already host-driven, so wrapping it in `async` is thin glue and does not belong in the kernel.
 - **The TypeScript cache ledger** (prefix-cache accounting): that is proxy-layer observability, not compression. `billion-context-wire` keeps only the order-preserving serialization it depends on.

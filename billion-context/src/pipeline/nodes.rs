@@ -465,6 +465,15 @@ impl Node for Recommend {
                 gap = true;
                 continue;
             }
+            // Media the host cannot restore. A fold rewrites text and the summary
+            // is text, so folding an image-bearing message keeps the prose and
+            // loses the image, with nothing behind `decompress` to bring it back.
+            // This is a hole, not a protected message: a protected one merely
+            // stays out of the range, a hole also stops the range spanning it.
+            if msg.has_unrecoverable_payload() {
+                gap = true;
+                continue;
+            }
             let Some(text) = msg.content.foldable_text() else {
                 gap = true;
                 continue;

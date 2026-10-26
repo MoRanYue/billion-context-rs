@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0 — 2026-10-27
+
+### Added
+
+- **Media protection.** `Message::with_unrecoverable_payload` /
+  `Message::has_unrecoverable_payload` mark a message whose payload a fold would
+  destroy: an image behind a remote URL, a provider file reference, a document.
+  The recommender treats such a message as a **hole** — no suggested range may
+  span it — so folding the text around it can never take the picture with it.
+
+  This was the last correctness gap against the reference kernel, and the only
+  one with no recovery path: a summary is text, so once an image block has been
+  folded there is nothing behind `decompress` to restore it.
+
+- `billion_context_wire::Block::has_unrecoverable_payload` and
+  `billion_context_wire::Message::has_unrecoverable_payload` — the Anthropic
+  classifier, so a host does not have to re-derive which media is restorable.
+  Inline `base64` and `data:` payloads keep their bytes and stay foldable; a
+  remote URL, a file id, or any block type this crate never modelled does not.
+
+### Changed (breaking)
+
+- `billion_context::Message` gained a public `unrecoverable_payload: bool`.
+  Struct literals must add it; the constructors (`Message::text`,
+  `Message::tool_call`, `Message::tool_result`) set it to `false`.
+- `billion_context_wire::Block::Unknown` now carries the block's whole
+  `Map<String, Value>` instead of being a unit marker. An unmodelled block used
+  to round-trip as `{"type":"unknown"}`, silently dropping an image's payload.
+
+  Caveat: the map is sorted, so key order inside an unknown block is not
+  preserved. `RawValue` would keep the bytes verbatim, but it cannot be used
+  while `Content` is `#[serde(untagged)]` — serde buffers the value through its
+  own `Content`, which has no raw-value support.
+
 ## 0.2.0 — 2026-10-26
 
 ### Added
