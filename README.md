@@ -19,6 +19,8 @@ billion-context-tool/   tool layer: folding, retrieval, search and status as too
 The default build has **zero dependencies** (`serde` and the real tokenizer are opt-in features), contains no `unsafe` (`#![forbid(unsafe_code)]`), and is fully synchronous.
 
 > Want a shorter introduction? See [`billion-context/README.md`](billion-context/README.md) — that is what crates.io shows.
+>
+> Releasing is automated through crates.io Trusted Publishing (OIDC, no stored API token): see [`RELEASING.md`](RELEASING.md).
 
 ---
 

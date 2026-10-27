@@ -19,6 +19,8 @@ billion-context-tool/          工具层：把折叠/恢复包装成模型可直
 默认构建**零依赖**（`serde` 与真分词器都是可选 feature），无 `unsafe`（`#![forbid(unsafe_code)]`），全部同步。
 
 > 英文简介见 [`billion-context/README.md`](billion-context/README.md) —— crates.io 上展示的就是它。
+>
+> 发布已自动化，走 crates.io Trusted Publishing（OIDC，不保存 API token）：见 [`RELEASING.md`](RELEASING.md)。
 
 ---
 
