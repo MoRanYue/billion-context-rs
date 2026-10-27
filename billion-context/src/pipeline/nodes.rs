@@ -284,6 +284,24 @@ impl Node for Prune {
 
         *io.messages = out;
 
+        // Folding removed messages; removing a message can remove half of a pair
+        // the wire format needs whole. Widening keeps pairs inside one range, but
+        // it cannot see a block-boundary fold or a transcript that arrived
+        // inconsistent, so the view is repaired before it is handed back.
+        let policy = ctx.policy;
+        let before = io.messages.len();
+        *io.messages = crate::orphans::repair(
+            std::mem::take(io.messages),
+            &|name: &str| policy.is_compress_tool(name),
+        );
+        let repaired = before - io.messages.len();
+        if repaired > 0 {
+            io.effects.warnings.push(format!(
+                "prune dropped {repaired} message(s) whose pair was folded away; \
+                 the request would have been rejected without this repair"
+            ));
+        }
+
         // Keep the fingerprint index tight: only still-folded content can be
         // resent as an original.
         io.state

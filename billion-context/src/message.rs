@@ -334,6 +334,13 @@ impl Message {
         )
     }
 
+    /// A thinking block. Providers that require it echoed back will 400 if it
+    /// arrives without the assistant text or tool call it produced, which is why
+    /// [`crate::orphans`] treats the pair as a unit.
+    pub fn reasoning(id: impl AsRef<str>, role: Role, text: impl AsRef<str>) -> Self {
+        Self::new(id, role, Content::Reasoning(Arc::from(text.as_ref())))
+    }
+
     pub fn tool_result(
         id: impl AsRef<str>,
         name: impl AsRef<str>,
