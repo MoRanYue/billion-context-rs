@@ -9,7 +9,11 @@ whatever the index does not already have.
 ```
 # bump billion-context + billion-context-tool (workspace version) and/or
 # billion-context-wire (its own literal version), update CHANGELOG.md
-git tag v0.4.0 && git push origin main --tags
+git commit -am "release 0.4.0"
+git push origin main
+# the workflow file must exist at the tagged commit, so tag after pushing main
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 The tag is a label for the release, not a version selector. Pushing `v0.4.0`
@@ -79,3 +83,25 @@ which a real run would skip — and uploads nothing. The dry run also skips the
 crates.io authentication step, so it works *before* any Trusted Publisher is
 configured; that order is the point: validate the packaging first, then turn on
 the credential.
+
+## Verifying the credential without publishing
+
+```
+gh workflow run release.yml -f dry_run=false
+```
+
+On a tree whose versions are all already on the index this exercises the entire
+path *except* the upload: the OIDC exchange runs for real, then every crate is
+skipped. The auth step's log is the proof:
+
+```
+Retrieving GitHub Actions JWT token with audience: crates.io
+Retrieved JWT token successfully
+Requesting token from: https://crates.io/api/v1/trusted_publishing/tokens
+Retrieved token successfully
+```
+
+This ran green on 2026-10-27 against all three crates, so the Trusted Publisher
+configuration is live and an OIDC token is really being issued. The one step not
+yet exercised end to end is the upload itself, which happens on the next version
+bump.
