@@ -74,4 +74,7 @@ finishing the rest.
 gh workflow run release.yml -f dry_run=true
 ```
 
-Packages and verifies all three crates, uploads nothing.
+Packages and verifies all three crates, uploads nothing. The dry run skips the
+crates.io authentication step, so it works *before* any Trusted Publisher is
+configured — that order is the point: validate the packaging first, then turn on
+the credential.
