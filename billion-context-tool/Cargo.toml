@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "billion-context-tool"
 version.workspace = true
 edition.workspace = true
@@ -13,5 +13,5 @@ categories = ["api-bindings", "text-processing"]
 readme = "README.md"
 
 [dependencies]
-billion-context = { version = "0.3.0", path = "../billion-context" }
+billion-context = { version = "0.4.0", path = "../billion-context" }
 serde_json = "1"
