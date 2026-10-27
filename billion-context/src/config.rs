@@ -228,6 +228,15 @@ impl ConfigError {
 /// The host hooks. Deliberately narrow: four pure predicates. A `dyn` trait
 /// object keeps `Engine` non-generic — these run once per message per turn, so
 /// the dispatch cost is noise next to the tokenizer call.
+/// Tool exchanges that are never foldable, whatever the configuration says.
+///
+/// `compress` is the fold request itself: folding the record of a fold removes the
+/// receipt the model needs to know what it already did, and the block it produced
+/// is the substitute for the content, not for the request. `acp_rule` is host
+/// policy — it states a constraint the session is being run under, so it is not
+/// history to be summarised but a rule still in force.
+pub const ALWAYS_PROTECTED_TOOLS: [&str; 2] = ["compress", "acp_rule"];
+
 pub trait Policy: Send + Sync + 'static {
     fn is_tool_protected(&self, _tool: &str, _input: Option<&str>) -> bool {
         false

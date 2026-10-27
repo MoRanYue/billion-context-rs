@@ -1,4 +1,4 @@
-﻿//! End-to-end walk through the API a host actually calls.
+//! End-to-end walk through the API a host actually calls.
 //!
 //! `cargo run --example basic`
 
@@ -55,6 +55,7 @@ fn main() {
     // ---------------------------------------------------------------------
     let first = turn.ranges[0].clone();
     let applied = session.apply_compression(CompressRequest {
+        call_id: None,
         ranges: vec![
             RequestedRange {
                 start: Boundary::Message(first.start),
@@ -149,6 +150,7 @@ fn main() {
                 now: 4_000,
             },
             &[CompressRequest {
+                call_id: None,
                 ranges: vec![RequestedRange {
                     start: Boundary::Message(target.start),
                     end: Boundary::Message(target.end),

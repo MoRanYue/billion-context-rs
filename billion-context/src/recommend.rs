@@ -284,6 +284,16 @@ pub(crate) fn protected_refs(
         if state.refs.is_blocked(&msg.id) {
             continue;
         }
+        // A tool exchange the kernel itself owns is never foldable, whatever the
+        // host configured: see ALWAYS_PROTECTED_TOOLS.
+        if msg
+            .content
+            .tool_name()
+            .is_some_and(|name| crate::config::ALWAYS_PROTECTED_TOOLS.contains(&name))
+        {
+            result.insert(r);
+            continue;
+        }
         let tokens = state.token_snapshot.get(&r).copied().unwrap_or(0);
         visible.push((r, tokens));
     }

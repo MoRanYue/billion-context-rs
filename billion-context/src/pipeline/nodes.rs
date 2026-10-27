@@ -161,8 +161,13 @@ pub const SUMMARY_HEADER: &str = "[Compressed conversation section]";
 /// The view-only id of an active block's summary message. Hosts must never mint
 /// an id with this prefix; it belongs to the kernel.
 pub fn summary_message_id(block: &crate::ids::BlockId) -> String {
-    format!("acp_summary_{block}")
+    format!("{SUMMARY_ID_PREFIX}{block}")
 }
+
+/// Prefix of every kernel-minted id. Such a message is a *synthetic* stand-in for
+/// content a block already owns, never a message the host sent — so it must not be
+/// folded into another block, and a resend can never collide with one.
+pub const SUMMARY_ID_PREFIX: &str = "acp_summary_";
 
 /// Render a block as the message that stands in for the span it covers.
 fn summary_message(block: &crate::state::Block) -> Message {
@@ -363,9 +368,25 @@ impl Node for Filter {
 // 10. hide-compress-calls
 // ---------------------------------------------------------------------------
 
-/// The model does not need to re-read its own compress exchanges forever. The
-/// **most recent** one stays visible: that is where the error text lives, and
-/// the model needs it to correct its next attempt.
+/// The model does not need to re-read its own compress exchanges forever — but
+/// *when* one becomes removable decides whether removing it is free or expensive.
+///
+/// A compress exchange whose block is still active is the model's record of work
+/// in progress: it says which ranges were already folded, which is exactly what the
+/// next attempt needs. A failed attempt is the only place the error text lives, and
+/// hiding it is what makes a deterministic model re-issue the same no-op compress
+/// forever.
+///
+/// So nothing is hidden on a quiet turn. Removal happens in two situations, both of
+/// which have already moved the provider's cached prefix anyway:
+///
+/// * the block was absorbed or expanded — the exchange is residue by definition;
+/// * a fold just landed and this orphan sits at or after the fold's earliest ref,
+///   which is inside the region whose cache was invalidated by the fold itself.
+///
+/// The old behaviour — hide everything except the newest pair, every turn — rotated
+/// one failure off the transcript per turn, moving the cache breakpoint for a few
+/// hundred bytes and costing far more at the seam than it saved.
 pub struct HideCompressCalls;
 
 impl Node for HideCompressCalls {
@@ -374,30 +395,72 @@ impl Node for HideCompressCalls {
     }
 
     fn run(&self, io: &mut NodeIo<'_>, ctx: &PipelineContext<'_>) {
-        let Some(last) = io.messages.iter().rposition(|m| {
-            matches!(&m.content, Content::ToolCall { name, .. } if ctx.policy.is_compress_tool(name))
-        }) else {
-            return;
-        };
+        // Which call produced which block, and whether that block still stands.
+        let mut any_block_call: HashSet<&str> = HashSet::new();
+        let mut active_call: HashSet<&str> = HashSet::new();
+        let mut legacy_active_without_id = false;
+        for block in &io.state.blocks {
+            match block.compress_call_id.as_deref() {
+                Some(id) => {
+                    any_block_call.insert(id);
+                    if block.active {
+                        active_call.insert(id);
+                    }
+                }
+                // A block from a host that never told us its call id. Without the
+                // id nothing can be matched, so every compress call has to be
+                // treated as live — under-hiding is safe, over-hiding loses the
+                // receipt the model needs.
+                None if block.active => legacy_active_without_id = true,
+                None => {}
+            }
+        }
 
-        let mut doomed: HashSet<Arc<str>> = HashSet::new();
-        for msg in io.messages.iter().take(last) {
-            if let Content::ToolCall { name, call_id, .. } = &msg.content {
-                if ctx.policy.is_compress_tool(name) {
-                    doomed.insert(call_id.clone());
+        let sweep_from = io.state.pending_orphan_sweep_min_ref;
+        let mut hide: HashSet<Arc<str>> = HashSet::new();
+        let mut newly_swept: Vec<String> = Vec::new();
+
+        for msg in io.messages.iter() {
+            let Content::ToolCall { name, call_id, .. } = &msg.content else {
+                continue;
+            };
+            if !ctx.policy.is_compress_tool(name) {
+                continue;
+            }
+            if active_call.contains(call_id.as_ref()) || legacy_active_without_id {
+                continue;
+            }
+            if any_block_call.contains(call_id.as_ref()) {
+                // Its block was absorbed or expanded: the exchange has been
+                // superseded and says nothing the block table does not.
+                hide.insert(call_id.clone());
+                continue;
+            }
+            if io.state.swept_orphan_call_ids.contains(call_id.as_ref()) {
+                hide.insert(call_id.clone());
+                continue;
+            }
+            if let (Some(from), Some(r)) = (sweep_from, io.state.refs.ref_of(&msg.id)) {
+                if r.index() >= from {
+                    hide.insert(call_id.clone());
+                    newly_swept.push(call_id.to_string());
                 }
             }
         }
-        if doomed.is_empty() {
-            return;
+
+        // The sweep point belongs to the fold that set it. Consuming it here keeps a
+        // later quiet turn from sweeping residue it did not pay to move.
+        io.state.pending_orphan_sweep_min_ref = None;
+        for call_id in newly_swept {
+            io.state.swept_orphan_call_ids.insert(call_id);
         }
 
-        let policy = ctx.policy;
+        if hide.is_empty() {
+            return;
+        }
         io.messages.retain(|m| match &m.content {
-            Content::ToolCall { name, call_id, .. } => {
-                !(policy.is_compress_tool(name) && doomed.contains(call_id))
-            }
-            Content::ToolResult { call_id, .. } => !doomed.contains(call_id),
+            Content::ToolCall { call_id, .. } => !hide.contains(call_id),
+            Content::ToolResult { call_id, .. } => !hide.contains(call_id),
             _ => true,
         });
     }

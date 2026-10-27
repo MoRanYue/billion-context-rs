@@ -44,6 +44,11 @@ pub struct Block {
     /// span is what a later citation has to match, and it is what upstream
     /// reports. Use [`Session::message_span_of`] to reach the messages.
     pub span: Option<(Boundary, Boundary)>,
+    /// The `tool_call_id` of the compress call that produced this block, when the
+    /// host told us. It is how the view decides whether a compress exchange is
+    /// still meaningful: a call whose block is active is the model's own record of
+    /// work in progress, a call whose block was absorbed or expanded is residue.
+    pub compress_call_id: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,6 +200,19 @@ pub struct State {
     pub nudge: NudgeState,
     pub stats: Stats,
     pub dead_refs: HashSet<MsgRef>,
+    /// Compress calls the view has already removed, by `tool_call_id`.
+    ///
+    /// Persistent and monotonic. A failed compress leaves a pair in the transcript
+    /// that says nothing after the first reading, but removing it on a quiet turn
+    /// moves the provider's cached prefix breakpoint for a few hundred bytes — the
+    /// seam costs more than the residue. So orphan removal is gated on a fold
+    /// having already moved that breakpoint, and once removed a pair stays removed:
+    /// resurrecting it mid-history would break the prefix a second time.
+    pub swept_orphan_call_ids: HashSet<String>,
+    /// Set by a fold that landed: the lowest ref it covered. Orphan compress calls
+    /// at or after this position sit in the part of the transcript whose cache was
+    /// just invalidated anyway, so sweeping them is free.
+    pub pending_orphan_sweep_min_ref: Option<u32>,
     pub next_block: u32,
     pub next_run: u32,
 }

@@ -302,6 +302,7 @@ mod tests {
                 now: 2,
             },
             &[CompressRequest {
+                call_id: None,
                 ranges: vec![RequestedRange {
                     start: Boundary::Message(range.start),
                     end: Boundary::Message(range.end),

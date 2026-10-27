@@ -140,6 +140,7 @@ mod integration_tests {
 
         let range = first.ranges[0].clone();
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(range.start),
                 end: Boundary::Message(range.end),
@@ -199,6 +200,7 @@ mod integration_tests {
 
         // Fold only the first piece of the split original.
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(2).unwrap()),
@@ -245,6 +247,7 @@ mod integration_tests {
             now: 1,
         });
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(2).unwrap()),
@@ -415,6 +418,7 @@ mod integration_tests {
         );
 
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(first.start),
                 end: Boundary::Message(first.end),

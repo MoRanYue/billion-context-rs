@@ -70,6 +70,14 @@ pub struct RequestedRange {
 pub struct CompressRequest {
     pub ranges: Vec<RequestedRange>,
     pub now: Timestamp,
+    /// The `tool_call_id` of the call that asked for this fold.
+    ///
+    /// Optional because a host may fold on its own initiative, but supplying it is
+    /// what lets the view tell a live compress exchange (its block is active) from
+    /// residue (the block was absorbed or expanded). Without it the kernel can only
+    /// count exchanges, and counting is what made the old rotation sweep a failure
+    /// off the transcript on every quiet turn.
+    pub call_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -361,7 +369,7 @@ impl Session {
         let mut tokens_compressed = 0u32;
 
         for range in req.ranges.iter() {
-            match self.apply_one(range, req.now) {
+            match self.apply_one(range, req.now, req.call_id.as_deref()) {
                 Ok((block, tokens)) => {
                     blocks.push(block);
                     tokens_compressed = tokens_compressed.saturating_add(tokens);
@@ -376,6 +384,20 @@ impl Session {
         }
 
         if !blocks.is_empty() {
+            // A fold just invalidated the cache from the lowest ref it touched, so
+            // stranded compress exchanges at or after that point can be swept for
+            // free — this is the only moment removal does not cost a prefix.
+            let sweep_from = blocks
+                .iter()
+                .filter_map(|id| self.state.block(*id))
+                .filter_map(|block| match block.span {
+                    Some((Boundary::Message(r), _)) => Some(r.index()),
+                    _ => None,
+                })
+                .min();
+            if let Some(from) = sweep_from {
+                self.state.pending_orphan_sweep_min_ref = Some(from);
+            }
             self.state.stats.compression_count += blocks.len() as u64;
             self.state.stats.tokens_compressed += tokens_compressed as u64;
             // A fold that landed resets the nudge cadence: the next reminder
@@ -416,6 +438,7 @@ impl Session {
         &mut self,
         range: &RequestedRange,
         now: Timestamp,
+        call_id: Option<&str>,
     ) -> Result<(BlockId, u32), (RangeErrorKind, String)> {
         let tier = self.derive_tier(range);
         let (requested_start, requested_end) = self.resolve_span(range)?;
@@ -445,6 +468,15 @@ impl Session {
             };
             if self.state.refs.is_blocked(id) {
                 blocked += 1;
+                continue;
+            }
+            // A rendered summary is synthetic: it exists only as this kernel's
+            // substitute for content an earlier block already owns. Folding one into
+            // a new block would bury a summary inside a summary, and the inner
+            // block's refs would then resolve through two layers of indirection to
+            // prose nobody can reach. Skip it; the block that owns it is named by
+            // its own boundary.
+            if id.as_str().starts_with(crate::pipeline::nodes::SUMMARY_ID_PREFIX) {
                 continue;
             }
             ids.push(id.clone());
@@ -552,6 +584,7 @@ impl Session {
             } else {
                 (range.start, range.end)
             }),
+            compress_call_id: call_id.map(str::to_owned),
         };
         self.state.blocks.push(block);
         for b in &absorbed {
@@ -652,10 +685,12 @@ impl Session {
         &self,
         range: &RequestedRange,
     ) -> Result<(MsgRef, MsgRef), (RangeErrorKind, String)> {
-        Ok((
-            self.resolve_one(range.start, true)?,
-            self.resolve_one(range.end, false)?,
-        ))
+        let start = self.resolve_one(range.start, true)?;
+        let end = self.resolve_one(range.end, false)?;
+        // A model that names its endpoints backwards means the same range as one
+        // that does not. Rejecting it teaches nothing and costs the model its whole
+        // attempt; swapping is what the reference kernel does.
+        Ok(if start > end { (end, start) } else { (start, end) })
     }
 
     fn resolve_one(
@@ -934,6 +969,7 @@ mod tests {
 
         let fold = |s: &mut Session, start: Boundary, end: Boundary, topic: &str| {
             let applied = s.apply_compression(CompressRequest {
+                call_id: None,
                 ranges: vec![RequestedRange {
                     start,
                     end,
@@ -1069,6 +1105,7 @@ mod tests {
         });
 
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(3).unwrap()),
@@ -1108,6 +1145,7 @@ mod tests {
             now: 1,
         });
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![
                 RequestedRange {
                     start: Boundary::Message(MsgRef::new(1).unwrap()),
@@ -1141,6 +1179,7 @@ mod tests {
             now: 1,
         });
         let make = |a: u32, b: u32| CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(a).unwrap()),
                 end: Boundary::Message(MsgRef::new(b).unwrap()),
@@ -1165,6 +1204,7 @@ mod tests {
             now: 1,
         });
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(2).unwrap()),
@@ -1196,6 +1236,7 @@ mod tests {
             now: 1,
         });
         let _ = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(3).unwrap()),
@@ -1240,6 +1281,7 @@ mod tests {
 
     fn fold_first_two(s: &mut Session) -> Applied {
         s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(1).unwrap()),
                 end: Boundary::Message(MsgRef::new(2).unwrap()),
@@ -1309,6 +1351,7 @@ mod tests {
 
         // Folding the block itself is the tier above what it absorbs.
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Block(block),
                 end: Boundary::Block(block),
@@ -1362,6 +1405,7 @@ mod tests {
 
         // m00003 is the result; m00002 is the call that produced it.
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(3).unwrap()),
                 end: Boundary::Message(MsgRef::new(3).unwrap()),
@@ -1397,6 +1441,7 @@ mod tests {
         });
 
         let applied = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(2).unwrap()),
                 end: Boundary::Message(MsgRef::new(2).unwrap()),
@@ -1424,6 +1469,7 @@ mod tests {
             now: 1,
         });
         let _ = s.apply_compression(CompressRequest {
+            call_id: None,
             ranges: vec![RequestedRange {
                 start: Boundary::Message(MsgRef::new(3).unwrap()),
                 end: Boundary::Message(MsgRef::new(3).unwrap()),

@@ -775,6 +775,7 @@ mod tests {
 
         let requests = parse_compress(&args).expect("the model's call parses");
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: requests,
             now: 2,
         });
@@ -887,6 +888,7 @@ mod tests {
         }] }))
         .expect("the model's call parses");
         let applied = session.apply_compression(CompressRequest {
+            call_id: None,
             ranges: requests,
             now: 2,
         });

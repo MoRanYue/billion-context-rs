@@ -235,6 +235,10 @@ fn main() {
                     });
                 }
                 let applied = session.apply_compression(CompressRequest {
+                    call_id: step
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     ranges,
                     now: 0,
                 });

@@ -34,6 +34,18 @@
 - `Session::message_span_of` — expand a block to the message refs underneath,
   following nested block boundaries.
 
+- `CompressRequest::call_id` — the tool call that prompted the fold, when the host
+  knows it. It is recorded on the block (`Block::compress_call_id`), which is what
+  lets the kernel tell a fold that is still in force from one that has been
+  absorbed and therefore says nothing a later turn needs.
+
+- `config::ALWAYS_PROTECTED_TOOLS` — `compress` and `acp_rule` are never foldable
+  regardless of `Policy::protected_tools`. The first is the fold request itself:
+  folding the record of a fold destroys the receipt of what was already done. The
+  second states a constraint the session runs under, which is policy still in
+  force, not history to summarise. A host that configured `protected_tools` to
+  replace rather than extend could silently drop either one.
+
 ### Changed
 
 - **`Block::span` is `Option<(Boundary, Boundary)>`**, not `(MsgRef, MsgRef)`.
@@ -54,12 +66,37 @@
 
 ### Fixed
 
+- **`HideCompressCalls` hid on a fixed schedule, which cost the prefix cache far
+  more than it saved.** It kept only the newest compress exchange and removed every
+  older one, every turn. Each removal shifted the cache breakpoint for a few hundred
+  bytes; at a seam that had already been paid for, that is a losing trade. Worse,
+  the blanket rule discarded the exchanges for *active* blocks — the model's record
+  of which ranges it had already folded — and the exchange of a *failed* attempt,
+  which is where the error text lives and the only thing that stops a deterministic
+  model from re-issuing the same no-op fold forever.
+
+  Removal now happens only where the prefix has already moved: a block that was
+  absorbed or expanded leaves residue by definition, and a fold invalidates the
+  cache from its lowest ref, so orphans at or after that point are free to sweep.
+  The sweep point belongs to the fold that set it and is consumed on use.
+
 - **`HideCompressCalls` never fired for this workspace's own tool surface.**
   `Policy::is_compress_tool` recognised only `compress` — the reference
   kernel's spelling — while `billion-context-tool` publishes the same tool as
   `acp_compress`. A host that registered the crate's tools therefore kept every
   fold request in the transcript as visible chatter, which is exactly the
   duplicate the node exists to remove. Both spellings are recognised now.
+
+- **A range whose endpoints were reversed was rejected, not read.** A caller that
+  wrote `m00007..m00003` meant the span between them; the kernel answered
+  `StartAfterEnd`. Ranges are normalised now, matching the reference kernel, so a
+  transposed pair folds the content the caller pointed at instead of failing.
+
+- **Synthetic identifiers were treated as foldable addresses.** A range endpoint
+  that names a first-message pin or a summary carrier is bookkeeping, not content:
+  folding it would erase the substitute for a block that is already folded. Such an
+  endpoint is no longer counted as a range member when deciding whether a fold
+  covers the range it claims.
 
 ### Verification
 
