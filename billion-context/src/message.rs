@@ -71,8 +71,6 @@ impl Content {
         }
     }
 
-    /// The text a compressor may fold. `ToolCall` returns `None`: its arguments
-    /// are user intent the host will execute, so rewriting them is forgery.
     /// The text payload, when this content is plain text.
     pub fn text(&self) -> Option<&str> {
         match self {
@@ -81,6 +79,8 @@ impl Content {
         }
     }
 
+    /// The text a compressor may fold. `ToolCall` returns `None`: its arguments
+    /// are user intent the host will execute, so rewriting them is forgery.
     pub fn foldable_text(&self) -> Option<&str> {
         match self {
             Content::Text(t) | Content::Reasoning(t) => Some(t),
@@ -104,6 +104,31 @@ impl Content {
     pub fn tool_name(&self) -> Option<&str> {
         match self {
             Content::ToolCall { name, .. } | Content::ToolResult { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// A tool call's arguments, verbatim.
+    ///
+    /// Not foldable text — a summary may not rewrite them — but they are bytes
+    /// the provider bills for and the only content a call carries, so anything
+    /// that sizes or identifies a message has to look here when
+    /// [`Content::foldable_text`] comes back empty.
+    pub fn tool_arguments(&self) -> Option<&str> {
+        match self {
+            Content::ToolCall { arguments, .. } => Some(arguments),
+            _ => None,
+        }
+    }
+
+    /// The call this content is half of: a call's own id, or the id a result
+    /// answers. `None` for prose. This — not array position — is the identity
+    /// that keeps a call and its result together through a fold.
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            Content::ToolCall { call_id, .. } | Content::ToolResult { call_id, .. } => {
+                Some(call_id)
+            }
             _ => None,
         }
     }
@@ -280,6 +305,21 @@ impl Message {
         );
         if let Some(text) = self.content.foldable_text() {
             h = feed(h, text.as_bytes());
+        } else if let Content::ToolCall {
+            name,
+            call_id,
+            arguments,
+        } = &self.content
+        {
+            // A call carries no prose, so feeding prose alone would leave every
+            // call with the same fingerprint. `reconcile` matches a resent
+            // original by fingerprint, so a collapsed baseline would make it
+            // keep the first call and drop the real one — and the tool pairing
+            // it should have preserved would go with it. Name, call id and
+            // arguments are the identity a provider gives a call.
+            h = feed(h, name.as_bytes());
+            h = feed(h, call_id.as_bytes());
+            h = feed(h, arguments.as_bytes());
         }
         h
     }

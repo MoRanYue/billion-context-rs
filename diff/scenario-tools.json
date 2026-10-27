@@ -1,0 +1,45 @@
+{
+  "contextLimit": 100000,
+  "steps": [
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u0", "role": "user", "kind": "text", "text": "round zero question about the build ", "repeat": 100 },
+        { "id": "c0a", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_0_a", "text": "{\"q\":\"alpha\"}" },
+        { "id": "c0b", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_0_b", "text": "{\"q\":\"beta\"}" },
+        { "id": "r0a", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_0_a", "text": "result alpha listing ", "repeat": 200 },
+        { "id": "r0b", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_0_b", "text": "result beta listing ", "repeat": 200 },
+        { "id": "a0", "role": "assistant", "kind": "text", "text": "round zero synthesis ", "repeat": 100 },
+
+        { "id": "u1", "role": "user", "kind": "text", "text": "round one question about the tests ", "repeat": 100 },
+        { "id": "c1a", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_1_a", "text": "{\"q\":\"gamma\"}" },
+        { "id": "c1b", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_1_b", "text": "{\"q\":\"delta\"}" },
+        { "id": "r1a", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_1_a", "text": "result gamma listing ", "repeat": 200 },
+        { "id": "r1b", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_1_b", "text": "result delta listing ", "repeat": 200 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "round one synthesis ", "repeat": 100 },
+
+        { "id": "u2", "role": "user", "kind": "text", "text": "round two question about the docs ", "repeat": 100 },
+        { "id": "c2a", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_2_a", "text": "{\"q\":\"epsilon\"}" },
+        { "id": "c2b", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_2_b", "text": "{\"q\":\"zeta\"}" },
+        { "id": "r2a", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_2_a", "text": "result epsilon listing ", "repeat": 200 },
+        { "id": "r2b", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_2_b", "text": "result zeta listing ", "repeat": 200 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "round two synthesis ", "repeat": 100 },
+
+        { "id": "u3", "role": "user", "kind": "text", "text": "round three question about the release ", "repeat": 100 },
+        { "id": "c3a", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_3_a", "text": "{\"q\":\"eta\"}" },
+        { "id": "c3b", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_3_b", "text": "{\"q\":\"theta\"}" },
+        { "id": "r3a", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_3_a", "text": "result eta listing ", "repeat": 200 },
+        { "id": "r3b", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_3_b", "text": "result theta listing ", "repeat": 200 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "round three synthesis ", "repeat": 100 },
+
+        { "id": "u4", "role": "user", "kind": "text", "text": "round four question about the api ", "repeat": 100 },
+        { "id": "c4a", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_4_a", "text": "{\"q\":\"iota\"}" },
+        { "id": "c4b", "role": "assistant", "kind": "tool-call", "toolName": "grep", "toolCallId": "call_4_b", "text": "{\"q\":\"kappa\"}" },
+        { "id": "r4a", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_4_a", "text": "result iota listing ", "repeat": 200 },
+        { "id": "r4b", "role": "tool", "kind": "tool-result", "toolName": "grep", "toolCallId": "call_4_b", "text": "result kappa listing ", "repeat": 200 },
+        { "id": "a4", "role": "assistant", "kind": "text", "text": "round four synthesis ", "repeat": 100 }
+      ]
+    }
+  ]
+}

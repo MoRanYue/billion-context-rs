@@ -100,11 +100,11 @@ impl Node for AssignRefs {
                             .push("ref capacity exhausted; message left unreferenced".into());
                         continue;
                     };
-                    let tokens = msg
+                    let sized = msg
                         .content
                         .foldable_text()
-                        .map(|t| ctx.estimator.count(t))
-                        .unwrap_or(0);
+                        .or_else(|| msg.content.tool_arguments());
+                    let tokens = sized.map(|t| ctx.estimator.count(t)).unwrap_or(0);
                     // Written once, read forever: re-estimating would churn the
                     // rendered tag bytes and bust the provider prefix cache.
                     io.state.token_snapshot.entry(r).or_insert(tokens);
@@ -481,7 +481,22 @@ impl Node for Recommend {
                 gap = true;
                 continue;
             }
-            let Some(text) = msg.content.foldable_text() else {
+            // A tool call has no prose a summary may rewrite, but it is foldable
+            // *content* all the same: the reference advertises every unprotected
+            // message and lets the pairing invariant keep each call with its
+            // result. Making a call a hole instead is what silently broke tool
+            // folding — `integrity_withdrawals` then sees both halves of every
+            // pair as split apart, withdraws every tool result, and a tool-heavy
+            // transcript reports almost nothing compressible even though it is
+            // exactly the transcript that most needs folding.
+            //
+            // Its arguments stand in for the text: they are the bytes the
+            // provider bills for, and the only content a call carries.
+            let Some(sized) = msg
+                .content
+                .foldable_text()
+                .or_else(|| msg.content.tool_arguments())
+            else {
                 gap = true;
                 continue;
             };
@@ -490,14 +505,14 @@ impl Node for Recommend {
                 msg_ref,
                 // The snapshot keeps a rendered session's numbers stable across
                 // turns; without rendering there is nothing to keep stable, so
-                // fall back to measuring the text itself.
+                // fall back to measuring the message itself.
                 tokens: io
                     .state
                     .token_snapshot
                     .get(&msg_ref)
                     .copied()
-                    .unwrap_or_else(|| ctx.estimator.count(text)),
-                chars: text.chars().count(),
+                    .unwrap_or_else(|| ctx.estimator.count(sized)),
+                chars: sized.chars().count(),
                 is_user: msg.role == Role::User,
                 index,
                 gap_before: gap,

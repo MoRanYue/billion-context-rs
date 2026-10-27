@@ -401,7 +401,64 @@ node diff/compare-tok.mjs diff/tok-ts.json diff/tok-rust.json
 
 ---
 
-## 七、还没做的
+## 七、工具调用（包括并行调用）
+
+一条 `Message` 只装一个 `Content`。所以 provider 的一条约含有 **N 个 `tool_use` 块**的消息
+（一次发起三个 grep），在核心里就是 N 条消息：
+
+```rust,ignore
+// Anthropic：一条 assistant 消息，三个 tool_use 块。
+// 核心：三条消息，每块一条。身份是 call id，不是数组位置。
+let mut history = vec![Message::text("u1", Role::User, question)];
+for call in calls {
+    history.push(Message::tool_call(call.id.clone(), call.name, call.call_id, call.arguments));
+}
+```
+
+拆开之后有两件事仍然成立，而它们才是要紧的：
+
+- **配对**。结果靠 `call_id` 找自己的调用，不靠数组位置。`turn_groups` 会把整个 burst
+  （reasoning run + 连续所有 assistant 动作 + 这些 call 指向的全部结果）收进**同一组**，
+  所以并行的一批要么一起折、要么都不折。结果的顺序无关紧要。
+- **可折叠**。范围可以跨过这些调用和它们的结果：它们是普通的可折叠内容，
+  `apply_compression` 会为这一轮生成一条摘要。
+
+拆开不是免费的——宿主把投影还给 provider 时，得把这 N 条重新合并成一条 assistant 消息，
+否则 Anthropic 直接拒绝、OpenAI 丢掉批次形状。`billion-context-wire` 直接建模了线格式
+（`Content::Blocks(Vec<Block>)`，含 `Block::ToolUse`），而它**不依赖**核心 crate，
+所以这个拆分/合并适配器属于宿主，跟"当前对接的是哪家 provider"这个知识放在一起。
+
+两个值得知道的细节：
+
+- **调用不是散文**。它的 arguments 是宿主将要执行的用户意图，所以折叠从不改写它们
+  （`Content::foldable_text` 对 `ToolCall` 返回 `None`）。但它照样参与计量——
+  `Content::tool_arguments` 是池子、范围、消息指纹所度量的东西，因为那才是 provider 计费的字节。
+- **调用是可折叠内容**。它可以被*摘掉*，尽管不可以被*改写*。早先一版把它当成 hole——
+  结果配对不变式把每一对都读成"被拆开"，于是撤掉每一个工具结果，
+  工具密集的对话最后只剩调用之间那些散文可折，而那恰恰是最需要折的对话。
+
+和媒体保护一样，配对保护是**建议而非否决**：推荐器绝不建议一条会拆散配对的范围，
+但 `apply_compression` 不会拒绝调用方自己点名的范围。如果你的模型自己写范围，请自行检查：
+
+```rust,ignore
+use std::collections::HashSet;
+
+let calls: HashSet<&str> = span
+    .iter()
+    .filter(|m| m.role == Role::Assistant)
+    .filter_map(|m| m.content.tool_call_id())
+    .collect();
+let results: HashSet<&str> = span
+    .iter()
+    .filter(|m| m.role == Role::Tool)
+    .filter_map(|m| m.content.tool_call_id())
+    .collect();
+assert_eq!(calls, results, "a range must take a call and its result together");
+```
+
+---
+
+## 八、还没做的
 
 - **异步适配**：`Engine` 已经是宿主驱动的，包一层 `async` 是薄胶水，没必要进内核。
 - **TS 版的 cache ledger**（前缀缓存账本）：属于代理层的观测逻辑，不属于压缩内核。`billion-context-wire` 里只保留了它依赖的"保序序列化"。

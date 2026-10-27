@@ -1,4 +1,4 @@
-﻿//! `billion-context` — a Rust port of billion-context's `acp-kernel`.
+//! `billion-context` — a Rust port of billion-context's `acp-kernel`.
 //!
 //! The engine folds an over-long conversation into cited summaries so a host can
 //! keep talking to a model past its context window. It is **pure and
@@ -270,5 +270,85 @@ mod integration_tests {
             Content::Reasoning(text) => assert!(text.contains(payload)),
             other => panic!("reasoning must survive as reasoning, got {other:?}"),
         }
+    }
+
+    /// A tool exchange is content a fold may take.
+    ///
+    /// The reference advertises every unprotected message and lets the pairing
+    /// invariant decide which of them may leave together. Treating a call as a
+    /// hole instead — because its arguments are not prose a summary may rewrite
+    /// — made the invariant read both halves of every pair as split apart,
+    /// withdraw every tool result, and leave a tool-heavy transcript offering
+    /// nothing but the prose between the calls. That is the transcript most in
+    /// need of folding.
+    #[test]
+    fn parallel_tool_calls_are_offered_for_folding() {
+        let mut config = Config::new(100_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        let mut session = Session::new(config).with_estimator(CharsAsTokens);
+
+        // One assistant turn issuing two calls at once: the shape a provider
+        // sends as a single message holding two tool_use blocks. The core has
+        // one block per message, so the host splits them — pairing still finds
+        // both results by call id, which is what keeps the pair together.
+        let mut history = vec![Message::text("u0", Role::User, "y".repeat(3_000))];
+        history.push(Message::tool_call("c0a", "grep", "call_0_a", "{\"q\":\"alpha\"}"));
+        history.push(Message::tool_call("c0b", "grep", "call_0_b", "{\"q\":\"beta\"}"));
+        history.push(Message::tool_result(
+            "r0a",
+            "grep",
+            "call_0_a",
+            "r".repeat(4_000),
+        ));
+        history.push(Message::tool_result(
+            "r0b",
+            "grep",
+            "call_0_b",
+            "r".repeat(4_000),
+        ));
+        history.push(Message::text("a0", Role::Assistant, "s".repeat(2_000)));
+        for i in 1..4 {
+            history.push(Message::text(format!("u{i}"), Role::User, "y".repeat(3_000)));
+            history.push(Message::text(
+                format!("a{i}"),
+                Role::Assistant,
+                "s".repeat(2_000),
+            ));
+        }
+
+        let turn = session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 60_000,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+        assert!(
+            !turn.ranges.is_empty(),
+            "a 60k transcript must offer something to fold"
+        );
+
+        // The first round is one offered range, and it spans both calls and
+        // both results rather than stopping between them.
+        let first = turn.ranges[0].clone();
+        assert_eq!(first.start.index(), 1);
+        assert!(
+            first.end.index() >= 5,
+            "the range must span both calls and both results, got {}..{}",
+            first.start,
+            first.end
+        );
+
+        let applied = session.apply_compression(CompressRequest {
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(first.start),
+                end: Boundary::Message(first.end),
+                topic: Some("tool round".into()),
+                summary: "Two greps ran in parallel and their results were read and summarised here.".into(),
+            }],
+            now: 2,
+        });
+        assert!(applied.is_ok(), "the offered range must fold: {applied:?}");
+        assert!(applied.tokens_compressed > 0);
     }
 }

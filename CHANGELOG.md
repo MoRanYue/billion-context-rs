@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A tool exchange could never be offered for folding.** The recommender
+  classified a message as compressible only when it had prose to rewrite, and a
+  `ToolCall` has none — its arguments are user intent the host executes, so a
+  summary may not touch them. The call therefore became a *hole*, which made the
+  pairing invariant read both halves of every pair as split apart: it withdrew
+  every tool result, and a transcript full of tool calls offered nothing but the
+  prose between them. A tool-heavy conversation — the one that most needs
+  folding — reported almost nothing compressible.
+
+  A call is now foldable *content* even though it is not foldable *text*. In a
+  5-round parallel-tool-call transcript the advertised pool goes from 4225 to
+  10472 tokens, and the ranges go from the 2-message prose gaps to the 6-message
+  rounds they should be — value-for-value what the TypeScript kernel reports.
+
+- **Every tool call had the same fingerprint**, because the fingerprint fed only
+  foldable text and a call has none. `reconcile` matches a resent original by
+  fingerprint, so a host that resends its transcript could have a call matched
+  against the wrong original — and the pairing it should have preserved would go
+  with it. A call now hashes its name, call id and arguments.
+
+- `token_snapshot` recorded `0` tokens for a tool call, so its arguments were
+  free in every pool and range total. They are counted now.
+
+### Added
+
+- `Content::tool_arguments` — a call's arguments verbatim, for anything that
+  sizes or identifies a message.
+- `Content::tool_call_id` — the call a piece of content is half of, whether it
+  is the call or the result. The identity that keeps a pair together through a
+  fold, and what a host needs to check a range it wrote itself.
+- README §8 "Tool calls, including parallel ones": one `Message` carries one
+  `Content`, so a provider message with N `tool_use` blocks is N core messages;
+  pairing still finds the results by call id, and the host merges them back on
+  the way out.
+
 ## 0.3.0 — 2026-10-27
 
 ### Added

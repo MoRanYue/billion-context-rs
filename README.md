@@ -420,7 +420,72 @@ can check the span before applying:
 let spans_media = view[start..=end].iter().any(Message::has_unrecoverable_payload);
 ```
 
-## 8. Not done
+## 8. Tool calls, including parallel ones
+
+One `Message` carries exactly one `Content`. A provider message holding **N
+`tool_use` blocks** — three greps issued at once — is therefore N core messages:
+
+```rust,ignore
+// Anthropic: one assistant message, three tool_use blocks.
+// Core: three messages, one block each. The call id is the identity.
+let mut history = vec![Message::text("u1", Role::User, question)];
+for call in calls {
+    history.push(Message::tool_call(call.id.clone(), call.name, call.call_id, call.arguments));
+}
+```
+
+Two things survive the split, and they are the ones that matter:
+
+- **Pairing.** `call_id` — not array position — is how a result finds its call.
+  `turn_groups` collects the whole burst (the reasoning run, every consecutive
+  assistant act, and every result those calls name) into **one** group, so a
+  parallel batch folds together or not at all. Result order is irrelevant.
+- **Folding.** A range may span the calls and their results: they are ordinary
+  foldable content, and `apply_compression` builds one summary for the round.
+
+The split is not free — a host that replays the projection to a provider has to
+merge the N messages back into one assistant message, or Anthropic rejects the
+request and OpenAI loses the batch shape. `billion-context-wire` models the wire
+form directly (`Content::Blocks(Vec<Block>)`, with `Block::ToolUse`), and does not
+depend on this crate, so the split/merge adapter belongs in the host, next to the
+knowledge of which provider it is talking to.
+
+Two details worth knowing:
+
+- **A call is not prose.** Its arguments are user intent the host will execute,
+  so a fold never rewrites them (`Content::foldable_text` is `None` for a
+  `ToolCall`). The arguments still count for sizing — `Content::tool_arguments`
+  is what the pool, the ranges and the message fingerprint measure, because they
+  are the bytes the provider bills for.
+- **A call is foldable content.** It may be *summarised away* even though it may
+  not be *rewritten*. Treating a call as a hole instead — as an earlier revision
+  did — makes the pairing invariant read both halves of every pair as split
+  apart, withdraws every tool result, and leaves a tool-heavy transcript
+  offering nothing but the prose between the calls. That is exactly the
+  transcript most in need of folding.
+
+Like the media guard, the pairing guard is **advice, not a veto**: the
+recommender never suggests a range that would split a pair, but
+`apply_compression` does not reject one a caller names. Check the span yourself
+if your model writes its own ranges:
+
+```rust,ignore
+use std::collections::HashSet;
+
+let calls: HashSet<&str> = span
+    .iter()
+    .filter(|m| m.role == Role::Assistant)
+    .filter_map(|m| m.content.tool_call_id())
+    .collect();
+let results: HashSet<&str> = span
+    .iter()
+    .filter(|m| m.role == Role::Tool)
+    .filter_map(|m| m.content.tool_call_id())
+    .collect();
+assert_eq!(calls, results, "a range must take a call and its result together");
+```
+
+## 9. Not done
 
 - **Async adapters**: `Engine` is already host-driven, so wrapping it in `async` is thin glue and does not belong in the kernel.
 - **The TypeScript cache ledger** (prefix-cache accounting): that is proxy-layer observability, not compression. `billion-context-wire` keeps only the order-preserving serialization it depends on.
