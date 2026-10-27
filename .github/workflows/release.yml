@@ -110,18 +110,32 @@ jobs:
               exit 1
             fi
 
+            # A dry run exists to prove the packaging works for whatever is about
+            # to be released, so it packages every crate — published or not — and
+            # only reports what a real run would have uploaded. Skipping the ones
+            # already on the index would make it a no-op on a clean tree and
+            # verify nothing.
+            if [ "$DRY_RUN" = "true" ]; then
+              if cargo publish --dry-run --locked -p "$pkg"; then
+                if is_published "$pkg" "$ver"; then
+                  printf '| %s | %s | verified — already published, a real run would skip it |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  printf '| %s | %s | verified — a real run would publish it |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              else
+                echo "::error::$pkg $ver does not package"
+                printf '| %s | %s | **packaging failed** |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+                failed=1
+              fi
+              continue
+            fi
+
             # The three crates version independently, so a tag does not name one
             # version: publish whatever is missing and skip the rest. That also
             # makes a re-run after a partial failure resume instead of aborting.
             if is_published "$pkg" "$ver"; then
               echo "::notice::$pkg $ver is already on crates.io — skipping"
               printf '| %s | %s | already published — skipped |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-
-            if [ "$DRY_RUN" = "true" ]; then
-              cargo publish --dry-run --locked -p "$pkg"
-              printf '| %s | %s | dry run — packaged and verified |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
