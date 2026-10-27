@@ -194,6 +194,19 @@ pub struct State {
     /// First-render token count per ref, written once and read forever so the
     /// rendered `<acp tokens=...>` tags never churn and bust the prefix cache.
     pub token_snapshot: HashMap<MsgRef, u32>,
+    /// The refs `apply_compression` may not fold: the recent-message zone, the
+    /// recent-token zone, the pinned last user message, and the kernel's own
+    /// always-protected tools, closure-completed over tool pairs.
+    ///
+    /// Captured from the view at the end of every turn. The recommender already
+    /// refuses to *offer* these, but the model may name them anyway — and a fold
+    /// that quietly takes a protected message files its summary above the question
+    /// it answers, so the check has to be repeated where the fold lands.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "HashSet::is_empty")
+    )]
+    pub protected_refs: HashSet<MsgRef>,
     /// Fingerprint of every folded message, so a stateless host that resends the
     /// original under a fresh id is recognised instead of double-counted.
     pub content_index: HashMap<u64, MessageId>,

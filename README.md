@@ -421,6 +421,13 @@ may span one.
 | reasoning ⇄ burst pairing | a rebuilt request whose thinking block lost the calls it justifies |
 | **media with no inline bytes** | images, documents and file references whose payload only the provider holds |
 
+Two of these are enforced beyond advice. A range that reaches into the protected
+zone — the first four rows — is **cut at the first protected message**, because
+the summary carrier is inserted at the covered segment's head: folding the
+suffix after a protected message files the summary *above* the question it
+answers. The pairing guards are closed by **widening** instead (see §8). Media is
+the exception and stays advisory (§7).
+
 The last one is the host's call, because only the host sees the wire form.
 `billion-context-wire` answers the Anthropic half:
 
@@ -495,10 +502,13 @@ Two details worth knowing:
   offering nothing but the prose between the calls. That is exactly the
   transcript most in need of folding.
 
-Like the media guard, the pairing guard is **advice, not a veto**: the
-recommender never suggests a range that would split a pair, but
-`apply_compression` does not reject one a caller names. Check the span yourself
-if your model writes its own ranges:
+The pairing guard is not a veto, but it is not pure advice either. The
+recommender never *suggests* a range that would split a pair, and
+`apply_compression` **widens** a caller-named range outward until every pair it
+touches is whole — rejecting would strand the caller, and narrowing would file a
+summary over half an exchange. Nothing is refused; the fold simply covers more
+than was asked. A host that cannot tolerate growth should check the span
+itself:
 
 ```rust,ignore
 use std::collections::HashSet;

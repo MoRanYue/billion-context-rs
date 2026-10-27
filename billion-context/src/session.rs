@@ -323,6 +323,12 @@ impl Session {
             .iter()
             .map(|m| (m.id.clone(), Shape::of(m)))
             .collect();
+        // The protected zone is a property of the view the model is about to see,
+        // not of the recommendation pass: `apply_compression` arrives on a later
+        // call with ranges of its own choosing, and has to know which messages it
+        // may not touch even when the model named them.
+        let protected = crate::recommend::protected_refs(&messages, &self.state, &self.config);
+        self.state.protected_refs = protected;
 
         Turn {
             messages,
@@ -454,12 +460,91 @@ impl Session {
         // how a summary ends up describing work nobody chose to compress.
         let widened = start != requested_start || end != requested_end;
 
+        // Where the protected zone begins inside this range, if it does.
+        //
+        // A protected message in the *interior* is a question the fold would answer
+        // from above: the summary anchor lands at the earliest covered position, so
+        // folding the suffix after it would file the summary before the question it
+        // summarises. Truncate at that boundary instead of carving a hole — the
+        // protected message and everything after it stay visible, and causality
+        // holds. A protected message at the *tail* (the advisory recent-zone brush
+        // this carve exists for) has nothing after it inside the range, so
+        // truncation is a no-op there and the plain carve stands.
+        let mut first_blocked: Option<u32> = None;
+        let mut foldable_after_blocked = 0usize;
+        for index in start.index()..=end.index() {
+            let Some(r) = MsgRef::new(index) else {
+                continue;
+            };
+            let Some(id) = self.state.refs.raw_of(r) else {
+                continue;
+            };
+            // Only the protected zone truncates. A media ref is blocked — the
+            // kernel could not recover its bytes — but that stays *advice*: a
+            // caller that wants to fold across a picture is allowed to, because
+            // refusing would make a multi-image transcript unfillable and the
+            // host may well have spilled those bytes itself.
+            let blocked_here = self.state.protected_refs.contains(&r);
+            if blocked_here && first_blocked.is_none() {
+                first_blocked = Some(index);
+            }
+            if first_blocked.is_some()
+                && !blocked_here
+                && !id.as_str().starts_with(crate::pipeline::nodes::SUMMARY_ID_PREFIX)
+            {
+                foldable_after_blocked += 1;
+            }
+        }
+        let mut cut = first_blocked.filter(|i| *i > start.index() && foldable_after_blocked > 0);
+        if let Some(at) = cut {
+            // Truncating must not strand a tool exchange across the cut: a kept call
+            // whose result is dropped is an unanswered `tool_call_id`, and a kept
+            // result whose call is dropped answers nothing. Either would be rejected
+            // by a strict provider, so the narrower range is not worth the risk —
+            // fall back to the plain carve.
+            let stranded = self.last_shapes.iter().any(|(id, shape)| {
+                let Some(r) = self.state.refs.ref_of(id) else {
+                    return false;
+                };
+                let idx = r.index();
+                if idx < start.index() || idx >= at {
+                    return false;
+                }
+                let partner = match shape {
+                    Shape::Call(call_id) | Shape::Result(call_id) => call_id,
+                    _ => return false,
+                };
+                self.last_shapes.iter().any(|(other_id, other_shape)| {
+                    if other_id == id {
+                        return false;
+                    }
+                    let same_key = match other_shape {
+                        Shape::Call(call_id) | Shape::Result(call_id) => call_id == partner,
+                        _ => false,
+                    };
+                    same_key
+                        && self
+                            .state
+                            .refs
+                            .ref_of(other_id)
+                            .is_some_and(|pr| pr.index() >= at && pr.index() <= end.index())
+                })
+            });
+            if stranded {
+                cut = None;
+            }
+        }
+        let covered_end = cut
+            .and_then(|c| c.checked_sub(1))
+            .and_then(MsgRef::new)
+            .unwrap_or(end);
+
         // Collect the refs this range covers.
         let covered = self.state.covered_ids();
         let mut ids = Vec::new();
         let mut tokens = 0u32;
         let mut blocked = 0usize;
-        for index in start.index()..=end.index() {
+        for index in start.index()..=covered_end.index() {
             let Some(r) = MsgRef::new(index) else {
                 continue;
             };
@@ -579,8 +664,8 @@ impl Session {
             active: true,
             expanded: false,
             restored_inline: false,
-            span: Some(if widened {
-                (Boundary::Message(start), Boundary::Message(end))
+            span: Some(if widened || cut.is_some() {
+                (Boundary::Message(start), Boundary::Message(covered_end))
             } else {
                 (range.start, range.end)
             }),

@@ -430,4 +430,73 @@ mod integration_tests {
         assert!(applied.is_ok(), "the offered range must fold: {applied:?}");
         assert!(applied.tokens_compressed > 0);
     }
+
+    /// A protected message in the middle of a range stops the fold there.
+    ///
+    /// The summary anchor lands at the earliest covered position, so folding past a
+    /// protected message would file the summary *before* the question it answers.
+    /// Truncating at the boundary keeps the question and every reply to it visible.
+    #[test]
+    fn a_protected_message_in_the_middle_truncates_the_fold() {
+        let mut config = Config::new(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        let mut session = Session::new(config).with_estimator(CharsAsTokens);
+
+        let history = vec![
+            Message::text("m0", Role::User, "y".repeat(400)),
+            Message::text("m1", Role::Assistant, "y".repeat(400)),
+            // The fold request itself: never foldable, whatever the config says.
+            Message::tool_call("m2", "compress", "call-1", "{\"ranges\":[]}".repeat(20)),
+            Message::tool_result("m3", "compress", "call-1", "y".repeat(400)),
+            Message::text("m4", Role::User, "y".repeat(400)),
+            Message::text("m5", Role::Assistant, "y".repeat(400)),
+        ];
+
+        let _first = session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 1_000,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let (start, end) = {
+            let refs = &session.state().refs;
+            let start = refs.ref_of(&history[0].id);
+            let end = refs.ref_of(&history[history.len() - 1].id);
+            match (start, end) {
+                (Some(start), Some(end)) => (start, end),
+                _ => panic!("the first turn must assign refs"),
+            }
+        };
+
+        // Ask for everything, including the compress exchange in the middle.
+        let applied = session.apply_compression(CompressRequest {
+            call_id: None,
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(start),
+                end: Boundary::Message(end),
+                topic: Some("bulk".into()),
+                summary: "Six short exchanges, summarised as far as the protected zone.".into(),
+            }],
+            now: 2,
+        });
+        assert!(applied.is_ok(), "the range must fold what it may: {applied:?}");
+
+        let block = &session.state().blocks[0];
+        assert_eq!(
+            block.direct.len(),
+            2,
+            "the fold must stop at the protected exchange, folded {:?}",
+            block.direct
+        );
+        assert!(
+            block.direct.iter().all(|id| id.as_str() != "m2"),
+            "the compress call is a receipt, not history: it stays visible"
+        );
+        assert!(
+            block.direct.iter().all(|id| id.as_str() != "m4"),
+            "everything after the protected exchange stays visible too"
+        );
+    }
 }

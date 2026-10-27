@@ -66,6 +66,17 @@
 
 ### Fixed
 
+- **`apply_compression` honoured a range that ran across a protected message.** The
+  recommender never *offers* one, but the model reads the rules, not the range list,
+  and may name anything ref-addressed. Nothing checked, so a fold could swallow the
+  recent window or the pinned last user message — and because the summary carrier is
+  inserted at the segment's head, its summary would land *above* the question it
+  answers. A range that touches the protected zone is now cut at the first protected
+  message (and dropped entirely if nothing foldable precedes it), while a range that
+  only brushes the zone still folds its prefix. The zone is captured from the view at
+  the end of each turn into `State::protected_refs`, so a fold arriving on a later
+  call is judged against what the model actually saw.
+
 - **`HideCompressCalls` hid on a fixed schedule, which cost the prefix cache far
   more than it saved.** It kept only the newest compress exchange and removed every
   older one, every turn. Each removal shifted the cache breakpoint for a few hundred
