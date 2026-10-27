@@ -34,6 +34,19 @@
 - `Session::message_span_of` — expand a block to the message refs underneath,
   following nested block boundaries.
 
+- `billion_context::prompts` — the compression rules as public constants
+  (`COMPRESS_PHILOSOPHY`, `HOW_TO_COMPRESS_RULES`, `TIER2_DISTILL_RULES`, …), so a
+  host can put them in a system prompt of its own instead of only reading them out
+  of `Nudge::text`.
+
+- `Message::reasoning` and `Message::with_unrecoverable_payload`, and
+  `State::protected_refs` — the zone `apply_compression` may not fold, captured
+  from the view at the end of each turn.
+
+- `truncate::TruncateOptions` — the knobs `EmergencyTruncate` uses to clip a
+  payload (`min_output_tokens`, `keep_prefix_chars`, `keep_suffix_chars`), public so
+  a host can predict what the node will do.
+
 - `CompressRequest::call_id` — the tool call that prompted the fold, when the host
   knows it. It is recorded on the block (`Block::compress_call_id`), which is what
   lets the kernel tell a fold that is still in force from one that has been
@@ -109,12 +122,47 @@
   endpoint is no longer counted as a range member when deciding whether a fold
   covers the range it claims.
 
+- **`EmergencyTruncate` deleted messages instead of clipping them.** When the tail
+  alone exceeded the model's limit, the node dropped the oldest messages whole —
+  starting with the first user message, which is the one providers are least happy
+  to lose — and left `.messages` shorter than the conversation actually was. It now
+  clips oversized payloads in place (`truncate.rs`): a tool result keeps its head and
+  tail plus `[truncated for context space]`, a tool call keeps its name and a
+  truncation counter, and nothing is removed from the transcript. Rounds are spared
+  while anything cheaper is left to clip, and a pinned first user message is never
+  touched.
+
+- **A fold could split a tool exchange, leaving a request a provider rejects.**
+  `apply_compression` took the caller's endpoints as given. A range that started
+  inside a round and ended inside the same round dropped a call without its result
+  (an unanswered `tool_call_id`) or a result without its call (an unclaimed answer);
+  the same held for a `Reasoning` block separated from the calls it justifies. Every
+  range is now **widened** outward until each pair it touches is whole. The fold
+  never refuses and never narrows — it covers more than asked, and that is the
+  cheaper error.
+
+- **The view could reach the provider with orphans in it.** Dropping one half of a
+  pair during folding, absorbing or truncation left the other half stranded, and a
+  strict endpoint rejects the whole request over it. `prune` now repairs the view it
+  is about to hand out: an unpaired call loses its known result-less form, an
+  unpaired result is dropped, and a reasoning block that no longer justifies a call
+  is withdrawn with it. Repair is idempotent — a repaired view repairs to itself.
+
+- **The nudge told the model *that* to compress but never *how*.** `Nudge::text`
+  named the ranges and stopped; the rules that make a summary usable — what to keep
+  verbatim, what to drop, that a cancelled objective is not a completed one — lived
+  only in the reference kernel's prompt module. `prompts.rs` now carries those five
+  passages verbatim and the nudge assembles them around the per-turn advice, so a
+  host that surfaces `Nudge::text` unchanged gets the same instructions the
+  reference kernel gives.
+
 ### Verification
 
-Differential harness vs the TypeScript kernel, three scenarios, 0 diffs:
+Differential harness vs the TypeScript kernel, four scenarios, 0 diffs:
 `scenario-a.json` (folding, retrieval, decompress, status),
-`scenario-tools.json` (parallel tool calls), and the new
-`scenario-tiers.json` (T1 → T2 → T3, block absorption, span reporting).
+`scenario-tools.json` (parallel tool calls),
+`scenario-tiers.json` (T1 → T2 → T3, block absorption, span reporting), and
+`scenario-inject.json` (nudge text, growth gating, terminal advice).
 
 ## 0.4.0 — 2026-10-27
 

@@ -475,4 +475,5 @@ assert_eq!(calls, results, "a range must take a call and its result together");
 - **异步适配**：`Engine` 已经是宿主驱动的，包一层 `async` 是薄胶水，没必要进内核。
 - **TS 版的 cache ledger**（前缀缓存账本）：属于代理层的观测逻辑，不属于压缩内核。`billion-context-wire` 里只保留了它依赖的"保序序列化"。
 - **原文存储**：`retrieve` 只返回摘要和它替换的区间；原文在宿主手里，怎么存（文件 / SQLite / 对象存储）由你决定，内核不替你选。
+- **可选的变换族** —— `ccr-store`、`absorb-hide`、`absorb-prompt`、`crush`、`messageFilters`，以及只为给它们把关而存在的 `pre-transform-snapshot` / `view-latch` 这一对。它们在参考内核的默认配置里**全部是 `enabled: false`**，所以默认配置下有没有它们行为完全一致；差分测试跑的就是默认配置，四个场景 0 差异。没移植的原因是每一个本身都是一个功能（光 `crush.ts` 就有 53 KB 的日志/堆栈/JSON 启发式），而且只要这些变换一个都不存在，view-latch 就没有可扣留的东西。真要用哪一个，说一声 —— 它要插入的形状（`Node`、`State`、`Effects`）都已经是公开的。
 

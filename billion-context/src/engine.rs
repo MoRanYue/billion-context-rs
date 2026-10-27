@@ -182,7 +182,7 @@ impl Engine {
 
     /// Render the instruction for this decision with the engine's prompt set and
     /// protocol. Public so a host that owns the message list can render the same
-    /// bytes without going through [`Engine::step`].
+    /// bytes without going through `Engine::step`.
     pub fn render(&self, nudge: &Nudge) -> RenderedNudge {
         render_nudge_text(
             nudge,

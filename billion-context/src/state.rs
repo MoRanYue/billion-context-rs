@@ -42,7 +42,7 @@ pub struct Block {
     /// The refs the caller named, **as named**. Folding `b3..b4` records
     /// `b3`/`b4`, not the messages those blocks happen to cover: the declared
     /// span is what a later citation has to match, and it is what upstream
-    /// reports. Use [`Session::message_span_of`] to reach the messages.
+    /// reports. Use [`crate::Session::message_span_of`] to reach the messages.
     pub span: Option<(Boundary, Boundary)>,
     /// The `tool_call_id` of the compress call that produced this block, when the
     /// host told us. It is how the view decides whether a compress exchange is
