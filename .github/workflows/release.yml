@@ -1,0 +1,140 @@
+name: Release
+
+# Publishes to crates.io with Trusted Publishing (OIDC), so no long-lived API
+# token lives in this repository. The `publish` job asks GitHub for a signed
+# identity token, hands it to crates.io in exchange for a 30-minute access
+# token, and uses that for `cargo publish`.
+#
+# One-time setup on crates.io, per crate (three times: billion-context,
+# billion-context-wire, billion-context-tool):
+#   Crate → Settings → Trusted Publishing → Add → GitHub
+#     Repository owner:  MoRanYue
+#     Repository name:   billion-context-rs
+#     Workflow filename: release.yml
+#     Environment:       release   (optional; must match the job below if set)
+#
+# A crate's first-ever version cannot use this: crates.io only offers the OIDC
+# exchange for crates that already exist, so the first publish needs an API
+# token as before.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Package and verify every crate, but upload nothing'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Two tags pushed together must not race for the same version, and a publish
+# that dies halfway should be finished by a re-run rather than by a second
+# workflow stepping on it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Optional. It gives you required reviewers / branch rules for free later
+    # without editing this file. A Trusted Publisher configured with no
+    # environment accepts any environment, so this matches either way.
+    environment: release
+    permissions:
+      contents: read # actions/checkout
+      id-token: write # the OIDC token crates.io verifies
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Publishing is irreversible — a version can be yanked but never replaced
+      # — so a red suite must stop the release. The tag push does not run ci.yml,
+      # hence the check here.
+      - name: Test
+        run: cargo test --workspace
+
+      # Must come after the slow steps: the exchanged token expires in 30
+      # minutes.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish unpublished crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          UA="billion-context-rs release workflow (https://github.com/${GITHUB_REPOSITORY})"
+
+          # Ask the index instead of trusting `cargo publish`'s exit code. Twice
+          # while this workspace was released by hand, the upload succeeded and
+          # the "waiting for availability" phase still failed; twice a dependent
+          # crate then failed because the index had not caught up. The index is
+          # the only statement of fact here.
+          is_published() {
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" \
+              "https://crates.io/api/v1/crates/$1/$2")
+            [ "$code" = "200" ]
+          }
+
+          wait_for_index() {
+            for _ in $(seq 1 30); do
+              if is_published "$1" "$2"; then return 0; fi
+              sleep 10
+            done
+            return 1
+          }
+
+          { echo '| crate | version | result |'; echo '|---|---|---|'; } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          # Dependency order: the tool crate depends on the kernel, so a version
+          # of each must be live before the next is packaged.
+          for pkg in billion-context-wire billion-context billion-context-tool; do
+            ver=$(cargo metadata --format-version 1 --no-deps \
+              | jq -r --arg p "$pkg" '.packages[] | select(.name == $p) | .version')
+            if [ -z "$ver" ] || [ "$ver" = "null" ]; then
+              echo "::error::could not read the version of $pkg"
+              exit 1
+            fi
+
+            # The three crates version independently, so a tag does not name one
+            # version: publish whatever is missing and skip the rest. That also
+            # makes a re-run after a partial failure resume instead of aborting.
+            if is_published "$pkg" "$ver"; then
+              echo "::notice::$pkg $ver is already on crates.io — skipping"
+              printf '| %s | %s | already published — skipped |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              cargo publish --dry-run --locked -p "$pkg"
+              printf '| %s | %s | dry run — packaged and verified |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            echo "::group::publishing $pkg $ver"
+            cargo publish --locked -p "$pkg" \
+              || echo "::warning::$pkg reported an error; checking the index before believing it"
+            echo "::endgroup::"
+
+            if wait_for_index "$pkg" "$ver"; then
+              printf '| %s | %s | **published** |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$pkg $ver is still absent from crates.io after five minutes"
+              printf '| %s | %s | **failed** — not on the index |\n' "$pkg" "$ver" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+
+          exit "$failed"
