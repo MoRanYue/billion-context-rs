@@ -12,7 +12,7 @@ use crate::config::{
 };
 use crate::error::{RangeError, RangeErrorKind};
 use crate::ids::{BlockId, Boundary, MessageId, MsgRef, Timestamp};
-use crate::message::Message;
+use crate::message::{Content, Message, Role};
 use crate::pipeline::{
     self, Effects, Node, NodeIo, PipelineContext, Range, RenderStrategy, ViewMode,
 };
@@ -148,6 +148,15 @@ pub struct Session {
     /// unambiguous, so this is what lets a resent original be recognised next
     /// turn instead of being re-admitted as fresh context.
     last_view: HashMap<MessageId, u64>,
+    /// The view's message order and the shape each message has, captured at the
+    /// end of every turn.
+    ///
+    /// Boundary widening needs it: a range that starts on a `tool_result` has to
+    /// reach back to the call that produced it, and a range that ends on a
+    /// `tool_call` has to reach forward to its result. Ref numbers alone cannot
+    /// answer that — they say nothing about which message answers which, and after
+    /// a prune a ref index is not a message index either.
+    last_shapes: Vec<(MessageId, Shape)>,
     /// Who rewrites the transcript when a block covers a span. See [`ViewMode`].
     view: ViewMode,
     /// Whether to re-identify a resent original by content. See
@@ -155,15 +164,45 @@ pub struct Session {
     reconcile: bool,
 }
 
+/// What a message is, for the purpose of keeping pairs whole.
+///
+/// A range is named by the model, and a model counts messages, not pairs. So a
+/// range can legitimately start on the result of a call and end on a call whose
+/// result is one message further on — both are requests the provider rejects.
+#[derive(Clone, Debug)]
+enum Shape {
+    /// Assistant tool call, carrying the id its result will answer.
+    Call(Arc<str>),
+    /// Tool result, carrying the id it answers.
+    Result(Arc<str>),
+    /// A thinking block; travels with the response that follows it.
+    Reasoning,
+    /// Assistant prose — the companion a reasoning run needs.
+    Act,
+    Other,
+}
+
+impl Shape {
+    fn of(message: &Message) -> Self {
+        match &message.content {
+            Content::ToolCall { call_id, .. } => Self::Call(call_id.clone()),
+            Content::ToolResult { call_id, .. } => Self::Result(call_id.clone()),
+            Content::Reasoning(_) => Self::Reasoning,
+            Content::Text(_) if message.role == Role::Assistant => Self::Act,
+            _ => Self::Other,
+        }
+    }
+}
+
 impl Session {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub fn new(config: Config) -> Self {        Self {
             config,
             policy: Arc::new(DefaultPolicy),
             estimator: Arc::new(CharsPerToken4),
             pipeline: pipeline::default_pipeline(),
             state: State::new(),
             last_view: HashMap::new(),
+            last_shapes: Vec::new(),
             view: ViewMode::default(),
             reconcile: true,
         }
@@ -214,6 +253,7 @@ impl Session {
             pipeline: pipeline::default_pipeline(),
             state: self.state.clone(),
             last_view: self.last_view.clone(),
+            last_shapes: self.last_shapes.clone(),
             view: self.view,
             reconcile: self.reconcile,
         }
@@ -270,6 +310,10 @@ impl Session {
         self.last_view = messages
             .iter()
             .map(|m| (m.id.clone(), m.fingerprint()))
+            .collect();
+        self.last_shapes = messages
+            .iter()
+            .map(|m| (m.id.clone(), Shape::of(m)))
             .collect();
 
         Turn {
@@ -374,13 +418,18 @@ impl Session {
         now: Timestamp,
     ) -> Result<(BlockId, u32), (RangeErrorKind, String)> {
         let tier = self.derive_tier(range);
-        let (start, end) = self.resolve_span(range)?;
+        let (requested_start, requested_end) = self.resolve_span(range)?;
+        let (start, end) = self.widen(requested_start, requested_end);
         if start > end {
             return Err((
                 RangeErrorKind::InvalidRef,
                 format!("{start} comes after {end}; a range must run forwards"),
             ));
         }
+        // A widened range covers more than the model asked for, and that must be
+        // visible: silently folding three extra messages the model never named is
+        // how a summary ends up describing work nobody chose to compress.
+        let widened = start != requested_start || end != requested_end;
 
         // Collect the refs this range covers.
         let covered = self.state.covered_ids();
@@ -498,7 +547,11 @@ impl Session {
             active: true,
             expanded: false,
             restored_inline: false,
-            span: Some((range.start, range.end)),
+            span: Some(if widened {
+                (Boundary::Message(start), Boundary::Message(end))
+            } else {
+                (range.start, range.end)
+            }),
         };
         self.state.blocks.push(block);
         for b in &absorbed {
@@ -507,6 +560,90 @@ impl Session {
             }
         }
         Ok((id, tokens))
+    }
+
+    /// Move a span outward until it no longer splits a tool pair or a reasoning
+    /// run.
+    ///
+    /// The model names a range by ref, and refs count messages, not pairs. A range
+    /// that starts on a `tool_result` leaves the call that produced it outside the
+    /// fold; a range that ends on a `tool_call` leaves its result outside. Both
+    /// produce a request the provider rejects outright, and both are the model
+    /// being reasonable about refs rather than careless.
+    ///
+    /// Widening only ever grows a span, never shrinks one, and it reports a failure
+    /// by leaving the boundary alone — a call whose result is invisible cannot be
+    /// repaired here, and `crate::orphans` cleans up afterwards.
+    fn widen(&self, requested_start: MsgRef, requested_end: MsgRef) -> (MsgRef, MsgRef) {
+        let position = |r: MsgRef| -> Option<usize> {
+            let id = self.state.refs.raw_of(r)?;
+            self.last_shapes.iter().position(|(x, _)| x == id)
+        };
+        let ref_at = |pos: usize| -> Option<MsgRef> {
+            self.state.refs.ref_of(&self.last_shapes.get(pos)?.0)
+        };
+
+        let mut start = requested_start;
+        let mut end = requested_end;
+
+        if let Some(mut i) = position(start) {
+            match &self.last_shapes[i].1 {
+                Shape::Result(call) => {
+                    while i > 0 {
+                        i -= 1;
+                        if matches!(&self.last_shapes[i].1, Shape::Call(c) if c == call) {
+                            if let Some(r) = ref_at(i) {
+                                start = r;
+                            }
+                            break;
+                        }
+                    }
+                }
+                Shape::Reasoning => {
+                    while i > 0 && matches!(self.last_shapes[i - 1].1, Shape::Reasoning) {
+                        i -= 1;
+                    }
+                    if let Some(r) = ref_at(i) {
+                        start = r;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(mut i) = position(end) {
+            match &self.last_shapes[i].1 {
+                Shape::Call(call) => {
+                    while i + 1 < self.last_shapes.len() {
+                        i += 1;
+                        if matches!(&self.last_shapes[i].1, Shape::Result(c) if c == call) {
+                            if let Some(r) = ref_at(i) {
+                                end = r;
+                            }
+                            break;
+                        }
+                    }
+                }
+                Shape::Reasoning => {
+                    while i + 1 < self.last_shapes.len()
+                        && matches!(self.last_shapes[i + 1].1, Shape::Reasoning)
+                    {
+                        i += 1;
+                    }
+                    if matches!(
+                        self.last_shapes.get(i + 1).map(|(_, s)| s),
+                        Some(Shape::Act | Shape::Call(_))
+                    ) {
+                        if let Some(r) = ref_at(i + 1) {
+                            end = r;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (start, end)
     }
 
     /// Turn a requested boundary pair into a concrete ref span, expanding block
@@ -1205,5 +1342,114 @@ mod tests {
         });
         assert_eq!(turn.messages.len(), 4, "the host does the surgery, not us");
         assert_eq!(s.status().active_blocks, 1, "but the block is still reported");
+    }
+
+    // -- boundary widening --------------------------------------------------
+
+    /// A model counts messages, not pairs. Naming the result without the call is
+    /// the most natural mistake in the world, and folding it verbatim would emit a
+    /// request every provider rejects.
+    #[test]
+    fn a_range_starting_on_a_result_widens_back_to_its_call() {
+        let mut s = session();
+        let msgs = tool_conversation();
+        let _ = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        // m00003 is the result; m00002 is the call that produced it.
+        let applied = s.apply_compression(CompressRequest {
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(MsgRef::new(3).unwrap()),
+                end: Boundary::Message(MsgRef::new(3).unwrap()),
+                topic: Some("search".into()),
+                summary: "The assistant searched the tree and the search returned two files.".into(),
+            }],
+            now: 2,
+        });
+        assert!(applied.is_ok(), "{:?}", applied.errors);
+        let block = s.block(applied.blocks[0]).expect("the block exists");
+        assert_eq!(block.direct.len(), 2, "call and result travel together");
+        assert_eq!(block.direct[0].as_str(), "c0");
+        assert_eq!(block.direct[1].as_str(), "r0");
+        assert_eq!(
+            block.span,
+            Some((
+                Boundary::Message(MsgRef::new(2).unwrap()),
+                Boundary::Message(MsgRef::new(3).unwrap())
+            )),
+            "the block records the span it actually folded, not the one requested"
+        );
+    }
+
+    #[test]
+    fn a_range_ending_on_a_call_widens_forward_to_its_result() {
+        let mut s = session();
+        let msgs = tool_conversation();
+        let _ = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let applied = s.apply_compression(CompressRequest {
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(MsgRef::new(2).unwrap()),
+                end: Boundary::Message(MsgRef::new(2).unwrap()),
+                topic: Some("search".into()),
+                summary: "The assistant searched the tree and the search returned two files.".into(),
+            }],
+            now: 2,
+        });
+        assert!(applied.is_ok(), "{:?}", applied.errors);
+        let block = s.block(applied.blocks[0]).expect("the block exists");
+        assert_eq!(block.direct.len(), 2);
+        assert_eq!(block.direct[1].as_str(), "r0");
+    }
+
+    /// The widened view must still be a legal request: neither half is left
+    /// dangling.
+    #[test]
+    fn a_widened_fold_leaves_no_orphan_behind() {
+        let mut s = session();
+        let msgs = tool_conversation();
+        let _ = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+        let _ = s.apply_compression(CompressRequest {
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(MsgRef::new(3).unwrap()),
+                end: Boundary::Message(MsgRef::new(3).unwrap()),
+                topic: Some("search".into()),
+                summary: "The assistant searched the tree and the search returned two files.".into(),
+            }],
+            now: 2,
+        });
+
+        let turn = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 3,
+        });
+        let ids: Vec<&str> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["u0", "acp_summary_b1", "a0"]);
+        assert!(turn.warnings.is_empty(), "{:?}", turn.warnings);
+    }
+
+    fn tool_conversation() -> Vec<Message> {
+        vec![
+            Message::text("u0", Role::User, "go look for the parser"),
+            Message::tool_call("c0", "grep", "call-1", "{\"q\":\"parser\"}"),
+            Message::tool_result("r0", "grep", "call-1", "two files matched"),
+            Message::text("a0", Role::Assistant, "found it"),
+        ]
     }
 }
