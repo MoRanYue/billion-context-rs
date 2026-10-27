@@ -127,13 +127,16 @@ impl Node for SyncBlocks {
 
     fn run(&self, io: &mut NodeIo<'_>, ctx: &PipelineContext<'_>) {
         let threshold = ctx.config.promotion_threshold;
-        let present: HashSet<&crate::ids::MessageId> = io.messages.iter().map(|m| &m.id).collect();
+        // Base ids: a block recorded whichever projection of an original was in
+        // the view when it folded, and a host that re-splits its surface may
+        // emit a sibling this turn. The original is still there.
+        let present: HashSet<&str> = io.messages.iter().map(|m| m.id.base()).collect();
         for block in io.state.blocks.iter_mut().filter(|b| b.active) {
             // A block whose covered messages are no longer in the transcript
             // stands in for nothing: the host replaced the surface, so the
             // block is history rather than a live summary. Retiring it here is
             // what keeps a stale carrier out of the next request.
-            if !block.direct.iter().any(|id| present.contains(id)) {
+            if !block.direct.iter().any(|id| present.contains(id.base())) {
                 block.active = false;
                 continue;
             }
@@ -190,8 +193,16 @@ impl Node for Prune {
         if ctx.view == super::ViewMode::Host {
             return;
         }
-        let covered: HashSet<crate::ids::MessageId> =
-            io.state.covered_ids().into_iter().cloned().collect();
+        // Keyed by base id: a host that split one provider message into
+        // `base#c0`, `base#r0` recorded whichever projection existed at fold
+        // time, and the next turn may emit a different one. Comparing verbatim
+        // would leave the sibling in the view as an unfolded original.
+        let covered: HashSet<String> = io
+            .state
+            .covered_ids()
+            .into_iter()
+            .map(|id| id.base().to_owned())
+            .collect();
         if covered.is_empty() {
             return;
         }
@@ -206,31 +217,31 @@ impl Node for Prune {
         // every live message instead would conflate two messages that happen to
         // carry identical text.
         for (i, m) in io.messages.iter().enumerate() {
-            if Some(i) == first_user || !covered.contains(&m.id) {
+            if Some(i) == first_user || !covered.contains(m.id.base()) {
                 continue;
             }
             io.state.content_index.insert(m.fingerprint(), m.id.clone());
         }
 
-        // Which block owns each covered id, the carrier for each block, and
-        // where that carrier goes: at the head of the span it replaces.
-        let mut owner: HashMap<crate::ids::MessageId, crate::ids::BlockId> = HashMap::new();
+        // Which block owns each covered original, the carrier for each block,
+        // and where that carrier goes: at the head of the span it replaces.
+        let mut owner: HashMap<String, crate::ids::BlockId> = HashMap::new();
         let mut order: Vec<crate::ids::BlockId> = Vec::new();
         let mut carriers: HashMap<crate::ids::BlockId, Message> = HashMap::new();
         for block in io.state.blocks.iter().filter(|b| b.active) {
             order.push(block.id);
             carriers.insert(block.id, summary_message(block));
             for id in block.direct.iter().chain(block.effective.iter()) {
-                owner.entry(id.clone()).or_insert(block.id);
+                owner.entry(id.base().to_owned()).or_insert(block.id);
             }
         }
 
         let mut anchor: HashMap<crate::ids::BlockId, usize> = HashMap::new();
         for (i, m) in io.messages.iter().enumerate() {
-            if Some(i) == first_user || !covered.contains(&m.id) {
+            if Some(i) == first_user || !covered.contains(m.id.base()) {
                 continue;
             }
-            if let Some(block) = owner.get(&m.id) {
+            if let Some(block) = owner.get(m.id.base()) {
                 anchor.entry(*block).or_insert(i);
             }
         }
@@ -250,7 +261,7 @@ impl Node for Prune {
                 }
                 next += 1;
             }
-            if Some(i) == first_user || !covered.contains(&message.id) {
+            if Some(i) == first_user || !covered.contains(message.id.base()) {
                 out.push(message.clone());
             }
         }
@@ -275,7 +286,9 @@ impl Node for Prune {
 
         // Keep the fingerprint index tight: only still-folded content can be
         // resent as an original.
-        io.state.content_index.retain(|_, id| covered.contains(id));
+        io.state
+            .content_index
+            .retain(|_, id| covered.contains(id.base()));
     }
 }
 
@@ -915,9 +928,7 @@ impl Node for RenderRefs {
             if matches!(ctx.render, RenderStrategy::TextOnly) && kind != ContentKind::Text {
                 continue;
             }
-            let Some(raw) = io.messages[i].content.body() else {
-                continue;
-            };
+            let raw = io.messages[i].content.payload();
             let clean = strip_own_tag(raw, &r.to_string());
 
             // The count is written on first render and reused forever. A tag

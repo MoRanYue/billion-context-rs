@@ -190,8 +190,16 @@ impl State {
     }
 
     /// Whether an active block already owns this message.
+    ///
+    /// Decided per *original* message: a host that splits one provider message
+    /// into `base#c0`, `base#c1` names projections of the same thing, and a
+    /// block that recorded one of them covers them all. Comparing ids verbatim
+    /// would let the sibling the host emits next turn walk back into the
+    /// transcript as an unfolded original.
     pub fn is_covered(&self, id: &MessageId) -> bool {
-        self.active_blocks().any(|b| b.effective.contains(id))
+        let base = id.base();
+        self.active_blocks()
+            .any(|b| b.effective.iter().any(|c| c.base() == base))
     }
 
     pub fn block(&self, id: BlockId) -> Option<&Block> {

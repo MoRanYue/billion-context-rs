@@ -96,6 +96,23 @@ impl MessageId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The original message this id is a projection of: everything before the
+    /// first `#`.
+    ///
+    /// A host that splits one provider message into several pieces — three
+    /// `tool_use` blocks in one assistant message become three core messages —
+    /// names them `base#c0`, `base#c1`, …, so the kernel can still tell they
+    /// are one original. Coverage, pruning and block lifetime are decided per
+    /// *original*, not per projection: otherwise a block that recorded one
+    /// projection stops covering the sibling the host happens to emit next
+    /// turn, the folded original reappears, and it can be folded a second time.
+    pub fn base(&self) -> &str {
+        match self.0.find('#') {
+            Some(0) | None => &self.0,
+            Some(at) => &self.0[..at],
+        }
+    }
 }
 
 impl fmt::Display for MessageId {
@@ -194,5 +211,20 @@ mod tests {
             Some(Boundary::Block(BlockId::new(12).unwrap()))
         );
         assert!(Boundary::parse("x1").is_none());
+    }
+
+    #[test]
+    fn a_projection_shares_its_original_id() {
+        // Hosts that keep one provider message whole name it plainly.
+        assert_eq!(MessageId::new("m00001").base(), "m00001");
+        // Hosts that split it into content blocks suffix each piece. Every
+        // piece is still that one original, which is what coverage, content
+        // indexing and block presence all have to agree on.
+        assert_eq!(MessageId::new("m00001#c0").base(), "m00001");
+        assert_eq!(MessageId::new("m00001#r3").base(), "m00001");
+        // An empty or trailing-only suffix degrades to the id itself rather
+        // than to an empty base that would cover everything.
+        assert_eq!(MessageId::new("#c0").base(), "#c0");
+        assert_eq!(MessageId::new("m00001#").base(), "m00001");
     }
 }

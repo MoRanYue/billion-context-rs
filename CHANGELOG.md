@@ -27,8 +27,21 @@
 - `token_snapshot` recorded `0` tokens for a tool call, so its arguments were
   free in every pool and range total. They are counted now.
 
+- **Coverage keyed on the whole id, but an id may name one piece of a message.**
+  A host that splits a provider message into content blocks — the TypeScript
+  kernel's `baseIdOf` convention, `base#c0`, `base#r0` — folds *a piece*, and the
+  next turn may re-emit a different piece of the same original. Matching ids
+  verbatim let that sibling back into the window as an unfolded original, which
+  is the exact content the host asked to fold. Coverage (`State::is_covered`),
+  the content index, and block presence now all compare `MessageId::base`, so
+  every projection of a folded original stays folded.
+
 ### Added
 
+- `strip_ref_tag` — remove a leading rendered ref tag. `RenderStrategy::All`
+  tags whatever payload a message carries, a tool call's arguments included
+  (value-for-value what the TypeScript kernel renders), so a host that parses
+  that payload as JSON for a provider strips it here.
 - `Content::tool_arguments` — a call's arguments verbatim, for anything that
   sizes or identifies a message.
 - `Content::tool_call_id` — the call a piece of content is half of, whether it

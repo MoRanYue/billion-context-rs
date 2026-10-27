@@ -133,8 +133,12 @@ impl Content {
         }
     }
 
-    /// Prepend a rendered ref tag. Only text-bearing variants are annotated;
-    /// a tool call's identity lives in its `call_id`, not in prose.
+    /// Prepend a rendered ref tag. Every variant carries bytes the provider
+    /// bills for, and the tag is the only handle the model has on a message it
+    /// may later fold — so a tool call is tagged over its arguments exactly as
+    /// prose is tagged over its text. Hosts that cannot tolerate a tagged
+    /// arguments string (they parse it as JSON for a provider) render with
+    /// [`crate::RenderStrategy::TextOnly`] instead.
     pub(crate) fn with_prefix(self, tag: &str) -> Content {
         match self {
             Content::Text(t) => Content::Text(Arc::from(format!("{tag}{t}"))),
@@ -148,12 +152,20 @@ impl Content {
                 call_id,
                 content: Arc::from(format!("{tag}{content}")),
             },
-            other => other,
+            Content::ToolCall {
+                name,
+                call_id,
+                arguments,
+            } => Content::ToolCall {
+                name,
+                call_id,
+                arguments: Arc::from(format!("{tag}{arguments}")),
+            },
         }
     }
 
-    /// Replace the text payload, keeping the variant. Rendering strips any stale
-    /// tag and re-stamps, so the bytes must be rebuildable from the body alone.
+    /// Replace the payload, keeping the variant. Rendering strips any stale tag
+    /// and re-stamps, so the bytes must be rebuildable from the body alone.
     pub(crate) fn with_body(self, body: &str) -> Content {
         match self {
             Content::Text(_) => Content::Text(Arc::from(body)),
@@ -167,7 +179,26 @@ impl Content {
                 call_id,
                 content: Arc::from(body),
             },
-            other => other,
+            Content::ToolCall {
+                name,
+                call_id,
+                arguments: _,
+            } => Content::ToolCall {
+                name,
+                call_id,
+                arguments: Arc::from(body),
+            },
+        }
+    }
+
+    /// The bytes rendering stamps a tag onto: prose for prose, arguments for a
+    /// call, output for a result. Distinct from [`Content::foldable_text`],
+    /// which withholds a call's arguments because no summary may rewrite them.
+    pub(crate) fn payload(&self) -> &str {
+        match self {
+            Content::Text(t) | Content::Reasoning(t) => t,
+            Content::ToolResult { content, .. } => content,
+            Content::ToolCall { arguments, .. } => arguments,
         }
     }
 
@@ -177,6 +208,44 @@ impl Content {
             _ => false,
         }
     }
+}
+
+/// Remove a leading rendered ref tag, if this payload begins with one.
+///
+/// [`RenderStrategy::All`](crate::RenderStrategy::All) stamps the tag onto
+/// whatever payload a message carries — a tool call's arguments included, for
+/// the same reason prose is tagged: the model can only fold what it can name.
+/// A host that turns that payload into a provider `tool_use` block has to parse
+/// it as JSON, so it strips the tag first:
+///
+/// ```
+/// # use billion_context::strip_ref_tag;
+/// let tagged = "<acp tokens=\"4\" type=\"grep\">m00002</acp>\n{\"q\":\"alpha\"}";
+/// assert_eq!(strip_ref_tag(tagged), "{\"q\":\"alpha\"}");
+/// assert_eq!(strip_ref_tag("untouched"), "untouched");
+/// ```
+///
+/// A host that would rather never see a tagged payload renders with
+/// [`RenderStrategy::TextOnly`](crate::RenderStrategy::TextOnly) instead.
+pub fn strip_ref_tag(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("<acp ") else {
+        return text;
+    };
+    let Some(gt) = rest.find('>') else {
+        return text;
+    };
+    let after = &rest[gt + 1..];
+    let Some(close) = after.find("</acp>") else {
+        return text;
+    };
+    // What sits between `>` and `</acp>` is a ref and nothing else. Anything
+    // else is message text that happens to start with the same bytes.
+    let ref_body = &after[..close];
+    if ref_body.is_empty() || ref_body.contains(char::is_whitespace) {
+        return text;
+    }
+    let rest = &after[close + "</acp>".len()..];
+    rest.strip_prefix('\n').unwrap_or(rest)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -346,9 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn prefix_skips_tool_calls() {
+    fn a_prefixed_tool_call_keeps_its_identity() {
         let call = Message::tool_call("a1", "x", "c1", "{}");
         let prefixed = call.content.clone().with_prefix("<tag/>");
-        assert_eq!(prefixed, call.content, "a tool call must not be rewritten");
+        // Pairing is by call id and naming by tool name: the tag rides on the
+        // payload and must not disturb either.
+        assert_eq!(prefixed.tool_call_id(), call.content.tool_call_id());
+        assert_eq!(prefixed.tool_name(), call.content.tool_name());
+        assert_eq!(prefixed.tool_arguments(), Some("<tag/>{}"));
+        // It stays unfoldable: a summary may never rewrite arguments.
+        assert_eq!(prefixed.foldable_text(), None);
     }
 }

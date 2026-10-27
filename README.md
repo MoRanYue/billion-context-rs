@@ -485,6 +485,22 @@ let results: HashSet<&str> = span
 assert_eq!(calls, results, "a range must take a call and its result together");
 ```
 
+Two more things a host will meet as soon as it splits messages:
+
+- **A rendered tag rides on the arguments.** `RenderStrategy::All` stamps the
+  tag onto whatever payload a message carries — arguments included, exactly as
+  the TypeScript kernel does — so a payload comes back as
+  `<acp tokens="4" type="grep">m00002</acp>\n{"q":"alpha"}`. If you parse that
+  payload as a provider `tool_use` input, call `strip_ref_tag` first; if you
+  would rather the kernel never touched structured content, render with
+  `RenderStrategy::TextOnly`.
+- **Ids may name a projection, not a message.** Hosts that split a provider
+  message into content blocks name the pieces `base#c0`, `base#r0` (the
+  TypeScript kernel's `baseIdOf`). Coverage, the content index, block presence
+  and the truncation budget all compare `MessageId::base`, so folding one piece
+  hides every other piece of that original on the next turn. Name a split
+  message however you like; keep one base per original.
+
 ## 9. Not done
 
 - **Async adapters**: `Engine` is already host-driven, so wrapping it in `async` is thin glue and does not belong in the kernel.

@@ -288,17 +288,23 @@ impl Session {
     /// active block; anything else is dead weight. That bound matters because a
     /// long-lived session would otherwise remember every message it ever saw.
     fn sync_content_index(&mut self, messages: &[Message]) {
-        let live: std::collections::HashSet<crate::ids::MessageId> =
-            messages.iter().map(|m| m.id.clone()).collect();
-        let covered: std::collections::HashSet<crate::ids::MessageId> =
-            self.state.covered_ids().into_iter().cloned().collect();
+        // Base ids, for the same reason coverage uses them: a `base#c0` index
+        // entry is still a live original when the host emits `base#c1`.
+        let live: std::collections::HashSet<String> =
+            messages.iter().map(|m| m.id.base().to_owned()).collect();
+        let covered: std::collections::HashSet<String> = self
+            .state
+            .covered_ids()
+            .into_iter()
+            .map(|id| id.base().to_owned())
+            .collect();
         // Live messages are never indexed: two of them may legitimately share
         // content, and remapping one onto the other would delete a real message.
         // The `prune` node records fingerprints at the moment it drops a folded
         // message, which is the only time the mapping is unambiguous.
         self.state
             .content_index
-            .retain(|_, id| live.contains(id) || covered.contains(id));
+            .retain(|_, id| live.contains(id.base()) || covered.contains(id.base()));
     }
 
     // -- folding -----------------------------------------------------------

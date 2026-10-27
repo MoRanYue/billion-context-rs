@@ -83,7 +83,7 @@ pub use config::{
 pub use engine::{engine, nudge_instruction, Engine, Next, Step};
 pub use error::{RangeError, RangeErrorKind};
 pub use ids::{BlockId, Boundary, MessageId, MsgRef, Timestamp};
-pub use message::{Content, ContentKind, Message, Role};
+pub use message::{strip_ref_tag, Content, ContentKind, Message, Role};
 pub use pipeline::{
     default_pipeline, pipeline_names, Effects, Node, NodeIo, Nudge, NudgeBreakdown, PipelineContext,
     Range, RenderStrategy, TerminalEscape, ViewMode,
@@ -161,6 +161,58 @@ mod integration_tests {
         // And the ref map is intact after the fold.
         assert_eq!(session.status().refs_allocated, 8);
         assert_eq!(session.status().active_blocks, 1);
+    }
+
+    /// A host that splits one provider message into content blocks names the
+    /// pieces `base#c0`, `base#r0`. Folding records whichever piece stood in the
+    /// span; the next turn may re-emit a different piece of the same original.
+    /// Matching ids verbatim would let that sibling back into the window as an
+    /// unfolded original — the exact thing the host asked to fold.
+    #[test]
+    fn a_sibling_projection_stays_covered_by_its_original() {
+        let mut config = Config::new(100_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        let mut session = Session::new(config).with_estimator(CharsAsTokens);
+
+        let history = vec![
+            Message::text("turn1", Role::User, "u".repeat(3_000)),
+            Message::text("split#c0", Role::Assistant, "a".repeat(3_000)),
+            Message::text("split#c1", Role::Assistant, "b".repeat(3_000)),
+            Message::text("turn2", Role::User, "c".repeat(3_000)),
+        ];
+        session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 6_000,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        // Fold only the first piece of the split original.
+        let applied = session.apply_compression(CompressRequest {
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(MsgRef::new(1).unwrap()),
+                end: Boundary::Message(MsgRef::new(2).unwrap()),
+                topic: Some("split".into()),
+                summary: "The host split one assistant message into two content blocks.".into(),
+            }],
+            now: 2,
+        });
+        assert!(applied.is_ok(), "{applied:?}");
+
+        let second = session.process_turn(TurnInput {
+            messages: &history,
+            token_count: 6_000,
+            render: RenderStrategy::None,
+            now: 3,
+        });
+        let ids: Vec<&str> = second.messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.iter().any(|id| id.starts_with("split#")),
+            "both pieces of a folded original must stay folded, got {ids:?}"
+        );
+        assert!(ids.contains(&"turn1"), "the opening user turn is pinned: {ids:?}");
+        assert!(ids.contains(&"turn2"), "live tail must survive: {ids:?}");
     }
 
     /// A stateless host resends the whole transcript every turn. Folded

@@ -456,6 +456,18 @@ let results: HashSet<&str> = span
 assert_eq!(calls, results, "a range must take a call and its result together");
 ```
 
+宿主一旦开始拆分消息，还会碰到两件事：
+
+- **渲染标签会压在 arguments 上。** `RenderStrategy::All` 把标签盖在消息所携带的载荷上——
+  arguments 也不例外，这与 TypeScript 内核逐字节一致——于是载荷变成
+  `<acp tokens="4" type="grep">m00002</acp>\n{"q":"alpha"}`。如果你要把它解析成
+  provider 的 `tool_use` input，先调 `strip_ref_tag`；如果你希望内核根本不碰结构化内容，
+  改用 `RenderStrategy::TextOnly` 渲染。
+- **id 可能指代的是"投影"而不是"消息"。** 把一条 provider 消息拆成内容块的宿主，
+  会把碎片命名为 `base#c0`、`base#r0`（即 TypeScript 内核的 `baseIdOf` 约定）。
+  覆盖判定、内容索引、块存活、截断预算四处都按 `MessageId::base` 比较，
+  所以折掉其中一片，下一轮该原件其余碎片也会一起消失。怎么命名随你，但同一条原件要共用一个 base。
+
 ---
 
 ## 八、还没做的
