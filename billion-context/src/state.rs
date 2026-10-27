@@ -1,6 +1,6 @@
 //! Blocks, the ref map, and the whole mutable state of one conversation.
 
-use crate::ids::{BlockId, MessageId, MsgRef, Timestamp};
+use crate::ids::{BlockId, Boundary, MessageId, MsgRef, Timestamp};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -39,7 +39,11 @@ pub struct Block {
     pub active: bool,
     pub expanded: bool,
     pub restored_inline: bool,
-    pub span: Option<(MsgRef, MsgRef)>,
+    /// The refs the caller named, **as named**. Folding `b3..b4` records
+    /// `b3`/`b4`, not the messages those blocks happen to cover: the declared
+    /// span is what a later citation has to match, and it is what upstream
+    /// reports. Use [`Session::message_span_of`] to reach the messages.
+    pub span: Option<(Boundary, Boundary)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

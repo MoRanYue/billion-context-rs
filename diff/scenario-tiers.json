@@ -1,0 +1,125 @@
+{
+  "contextLimit": 100000,
+  "config": {
+    "tiers": { "enabled": true, "tier2Trigger": 1, "tier3Trigger": 2 },
+    "nudge": {
+      "tierGrowthTokens": { "t1": 100, "t2": 200, "t3": 300 },
+      "growthCap": 50000,
+      "minPressureBenefitTokens": 100
+    },
+    "preserveRecentMessages": 0, "preserveRecentTokens": 0
+  },
+  "steps": [
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u0", "role": "user", "kind": "text", "text": "question about the parser ", "repeat": 100 },
+        { "id": "a0", "role": "assistant", "kind": "text", "text": "the parser reads tokens ", "repeat": 100 },
+        { "id": "u1", "role": "user", "kind": "text", "text": "question about the lexer ", "repeat": 100 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "the lexer splits chars ", "repeat": 100 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "question about the emitter ", "repeat": 100 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "the emitter writes ir ", "repeat": 100 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "question about the cache ", "repeat": 100 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "the cache keys on bytes ", "repeat": 100 }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "m00001",
+          "endRef": "m00004",
+          "topic": "parser and lexer",
+          "summary": "The user asked how the parser reads tokens and how the lexer splits characters, and the assistant described both stages of the front end."
+        }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "m00005",
+          "endRef": "m00008",
+          "topic": "emitter and cache",
+          "summary": "The user asked how the emitter writes intermediate representation and how the cache keys entries, and the assistant answered both."
+        }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u0", "role": "user", "kind": "text", "text": "question about the parser ", "repeat": 100 },
+        { "id": "a0", "role": "assistant", "kind": "text", "text": "the parser reads tokens ", "repeat": 100 },
+        { "id": "u1", "role": "user", "kind": "text", "text": "question about the lexer ", "repeat": 100 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "the lexer splits chars ", "repeat": 100 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "question about the emitter ", "repeat": 100 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "the emitter writes ir ", "repeat": 100 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "question about the cache ", "repeat": 100 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "the cache keys on bytes ", "repeat": 100 }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "b1",
+          "endRef": "b1",
+          "topic": "front end distilled",
+          "summary": "Front-end stages: the parser reads tokens, the lexer splits characters into them, the emitter writes the intermediate representation and the cache keys on raw bytes."
+        }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "b2",
+          "endRef": "b2",
+          "topic": "back end distilled",
+          "summary": "Back-end stages: emission consumes the intermediate representation and the cache stores finished units keyed by their exact byte sequence."
+        }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u0", "role": "user", "kind": "text", "text": "question about the parser ", "repeat": 100 },
+        { "id": "a0", "role": "assistant", "kind": "text", "text": "the parser reads tokens ", "repeat": 100 },
+        { "id": "u1", "role": "user", "kind": "text", "text": "question about the lexer ", "repeat": 100 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "the lexer splits chars ", "repeat": 100 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "question about the emitter ", "repeat": 100 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "the emitter writes ir ", "repeat": 100 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "question about the cache ", "repeat": 100 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "the cache keys on bytes ", "repeat": 100 }
+      ]
+    },
+    {
+      "op": "apply",
+      "ranges": [
+        {
+          "startRef": "b3",
+          "endRef": "b4",
+          "topic": "whole pipeline",
+          "summary": "The compiler pipeline is lexer to parser to emitter to cache, and each stage is a pure function of the one before it."
+        }
+      ]
+    },
+    {
+      "op": "turn",
+      "tokenCount": 60000,
+      "messages": [
+        { "id": "u0", "role": "user", "kind": "text", "text": "question about the parser ", "repeat": 100 },
+        { "id": "a0", "role": "assistant", "kind": "text", "text": "the parser reads tokens ", "repeat": 100 },
+        { "id": "u1", "role": "user", "kind": "text", "text": "question about the lexer ", "repeat": 100 },
+        { "id": "a1", "role": "assistant", "kind": "text", "text": "the lexer splits chars ", "repeat": 100 },
+        { "id": "u2", "role": "user", "kind": "text", "text": "question about the emitter ", "repeat": 100 },
+        { "id": "a2", "role": "assistant", "kind": "text", "text": "the emitter writes ir ", "repeat": 100 },
+        { "id": "u3", "role": "user", "kind": "text", "text": "question about the cache ", "repeat": 100 },
+        { "id": "a3", "role": "assistant", "kind": "text", "text": "the cache keys on bytes ", "repeat": 100 }
+      ]
+    }
+  ]
+}

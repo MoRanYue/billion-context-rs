@@ -667,19 +667,15 @@ impl Node for Recommend {
 // 12. nudge-inject
 // ---------------------------------------------------------------------------
 
-/// Total summary tokens of the active blocks one tier above `tier`, which is
-/// exactly the mass folding that tier would reclaim.
-fn summary_tokens(
-    state: &crate::state::State,
-    ctx: &PipelineContext<'_>,
-    tier: u8,
-) -> u32 {
+/// The active blocks at `tier`, in fold order. These are what folding one tier
+/// higher would absorb, and their summaries are the mass that tier reclaims.
+fn tier_blocks(state: &crate::state::State, tier: u8) -> Vec<crate::state::Block> {
     state
         .blocks
         .iter()
         .filter(|b| b.active && b.tier as u8 == tier)
-        .map(|b| ctx.estimator.count(&b.summary))
-        .sum()
+        .cloned()
+        .collect()
 }
 
 /// Decides whether to tell the model to compress, and at which urgency. The
@@ -715,11 +711,9 @@ impl Node for NudgeInject {
             ctx.token_count
         };
         let growth = ctx.token_count.saturating_sub(reference);
-        // Pending is per tier, and the number worth reporting is the best any
-        // tier can offer: T1 is what could be folded right now (only ranges big
-        // enough that the apply-side gate would not reject them), T2 and T3 are
-        // the summary mass of the active blocks those tiers would fold. Reporting
-        // T1 alone made a session that had just folded look empty.
+        // T1 is what could be folded right now — only ranges big enough that
+        // the apply-side gate would not reject them. T2/T3 are computed further
+        // down from the block table, once the tier thresholds exist.
         let min_chars = cfg.compress.min_compress_range;
         let pending_t1: u32 = io
             .effects
@@ -728,16 +722,11 @@ impl Node for NudgeInject {
             .filter(|r| min_chars == 0 || r.chars >= min_chars)
             .map(|r| r.tokens)
             .sum();
-        let pending_t2 = summary_tokens(io.state, ctx, 1);
-        let pending_t3 = summary_tokens(io.state, ctx, 2);
-        let pending = pending_t1.max(pending_t2).max(pending_t3);
 
-        // Two independent gates, reported together. Folding less than the pool
-        // threshold is not worth interrupting the model for, however much the
-        // conversation has grown since the last nudge. Both are derived from the
-        // context limit, so one config behaves the same on a 32K model and a 1M
-        // one instead of drifting with absolute token counts.
-        let pool_threshold = if cfg.model_context_limit == 0 {
+        // The growth step, derived from the context limit so one config behaves
+        // the same on a 32K model and a 1M one instead of drifting with absolute
+        // token counts.
+        let nudge_growth_tokens = if cfg.model_context_limit == 0 {
             cfg.nudge.growth_floor
         } else {
             let scaled =
@@ -746,9 +735,48 @@ impl Node for NudgeInject {
                 .max(cfg.nudge.growth_floor)
                 .min(cfg.nudge.growth_cap)
         };
-        let growth_floor = (cfg.nudge.min_growth_ratio * pool_threshold as f32)
+        let growth_floor = (cfg.nudge.min_growth_ratio * nudge_growth_tokens as f32)
             .round()
             .max(cfg.nudge.min_growth_floor as f32) as u32;
+        let min_pressure_benefit = cfg.nudge.min_pressure_benefit_tokens.unwrap_or_else(|| {
+            ((cfg.model_context_limit as f32 * 0.01).round() as u32).max(5_000)
+        });
+
+        // Per-tier mass. A tier-2 nudge is not "more messages to fold": it is
+        // "fold these tier-1 blocks", and a tier-3 nudge folds tier-2 blocks.
+        // Both compare summary mass, never message counts — a summary is ~10:1
+        // condensed, so measuring it against raw pending starves the upper
+        // tiers forever.
+        let t1_blocks = tier_blocks(io.state, 1);
+        let t2_blocks = tier_blocks(io.state, 2);
+        let pending_t2: u32 = t1_blocks
+            .iter()
+            .map(|b| ctx.estimator.count(&b.summary))
+            .sum();
+        let pending_t3: u32 = t2_blocks
+            .iter()
+            .map(|b| ctx.estimator.count(&b.summary))
+            .sum();
+        let t2_count = t1_blocks.len() as u32;
+        let t3_count = t2_blocks.len() as u32;
+        // The best any tier can offer: the number the decision compares.
+        let pending = pending_t1.max(pending_t2).max(pending_t3);
+
+        let over_limit = usage >= cfg.nudge.max_context_limit_pct;
+        let emergency = usage >= cfg.nudge.emergency_threshold_pct;
+        // The pressure band bypasses the growth gate and the per-tier cadence:
+        // when the window is this full, waiting for another growth step is not
+        // an option. It is still gated on the benefit floor below.
+        let pressure = over_limit || emergency;
+
+        // While a nudge is still unanswered the bar halves; otherwise a session
+        // that is already above the limit has to grow a whole step before being
+        // told again.
+        let effective_threshold = if last_shown > 0 {
+            nudge_growth_tokens / 2
+        } else {
+            nudge_growth_tokens
+        };
 
         // A session can arrive already full: a stateless host replaying a whole
         // history, or a restored state. Growth then reads as zero and the floor
@@ -759,37 +787,214 @@ impl Node for NudgeInject {
         let first_sight_mass_ready = last_shown == 0
             && baseline == 0
             && usage >= cfg.nudge.min_context_limit_pct
-            && pending >= pool_threshold;
+            && pending >= nudge_growth_tokens;
         let growth_ready = first_sight_mass_ready || growth >= growth_floor;
 
-        let mut reasons: Vec<String> = Vec::new();
-        if pending < pool_threshold {
-            reasons.push(format!(
-                "max compressible {pending} < threshold {pool_threshold}"
-            ));
-        }
-        if !growth_ready {
-            reasons.push(format!("growth {growth} < floor {growth_floor}"));
+        // Tier thresholds: T1 defaults to the growth step, T2/T3 to that step
+        // scaled by `tier2_growth_multiplier`. Each can be pinned individually
+        // through `tier_growth_tokens`; an unset one keeps its derived default,
+        // so an absent struct decides byte-identically.
+        let shared_tier_threshold =
+            (nudge_growth_tokens as f32 * cfg.nudge.tier2_growth_multiplier).round() as u32;
+        let pinned = cfg.nudge.tier_growth_tokens.as_ref();
+        let tier_thresholds = [
+            pinned.and_then(|t| t.t1).unwrap_or(nudge_growth_tokens),
+            pinned.and_then(|t| t.t2).unwrap_or(shared_tier_threshold),
+            pinned.and_then(|t| t.t3).unwrap_or(shared_tier_threshold),
+        ];
+        let t2_pinned = pinned.and_then(|t| t.t2).is_some();
+        let t3_pinned = pinned.and_then(|t| t.t3).is_some();
+
+        // Block COUNT on its own is not a need signal — condensed summaries can
+        // stack thousands of blocks that reclaim almost nothing, and each
+        // distillation rewrites the wire from the fold anchor onward (prefix
+        // cache loss). The count path therefore ships effectively off
+        // (1000 / 2000) and is honoured only when explicitly configured.
+        let t2_count_ready = t2_count >= cfg.tiers.tier2_trigger;
+        let t3_count_ready = t3_count >= cfg.tiers.tier3_trigger;
+        let tiers_enabled = cfg.tiers.enabled;
+
+        let usage_pct = (usage * 100.0).round() as i64;
+        let mut injected: Option<u8> = None;
+        let mut best_pending = 0u32;
+        let mut reason = String::new();
+
+        if pressure {
+            // Under pressure, route to whichever tier reclaims the most; the
+            // only thing that stops it is having nothing worth reclaiming.
+            let candidates: &[u8] = if tiers_enabled { &[1, 2, 3] } else { &[1] };
+            for &t in candidates {
+                let p = match t {
+                    1 => pending_t1,
+                    2 => pending_t2,
+                    _ => pending_t3,
+                };
+                if p > best_pending {
+                    best_pending = p;
+                    injected = Some(t);
+                }
+            }
+            // A sub-threshold pending can never look actionable however hot the
+            // band is, otherwise every "success" resets the baselines and the
+            // same nudge re-injects each turn.
+            if best_pending < min_pressure_benefit {
+                injected = None;
+            }
+            if let Some(b) = injected {
+                let label = if emergency { "EMERGENCY" } else { "OVER-LIMIT" };
+                reason = if b == 1 {
+                    format!(
+                        "{label} T1: max effective pending {best_pending}, usage {usage_pct}%"
+                    )
+                } else {
+                    format!(
+                        "{label} T{b} distill: max pending {best_pending} (T1 effective {pending_t1}, T2 {pending_t2}, T3 {pending_t3}), usage {usage_pct}%"
+                    )
+                };
+            }
+        } else if growth_ready {
+            if pending_t1 >= tier_thresholds[0] {
+                injected = Some(1);
+                reason = format!(
+                    "T1 effective {pending_t1} >= {}, growth {growth}, usage {usage_pct}%",
+                    tier_thresholds[0]
+                );
+            } else if tiers_enabled
+                && (t2_count_ready || (pending_t2 >= tier_thresholds[1] && pending_t2 > pending_t1))
+            {
+                let last = io.state.nudge.shown_by_tier.get(&2).copied().unwrap_or(0);
+                if last == 0 || ctx.token_count.saturating_sub(last) >= growth_floor {
+                    injected = Some(2);
+                    reason = if t2_count_ready {
+                        format!(
+                            "T2 distill ready: {t2_count} tier-1 blocks >= tier2Trigger {} ({pending_t2} tokens), usage {usage_pct}%",
+                            cfg.tiers.tier2_trigger
+                        )
+                    } else {
+                        let suffix = if t2_pinned { "" } else { " (1.5x)" };
+                        format!(
+                            "T2 distill ready: {t2_count} tier-1 blocks ({pending_t2} tokens) >= {}{suffix} and > T1 effective {pending_t1}, usage {usage_pct}%",
+                            tier_thresholds[1]
+                        )
+                    };
+                }
+            } else if tiers_enabled
+                && (t3_count_ready
+                    || (pending_t3 >= tier_thresholds[2]
+                        && pending_t3 > pending_t2
+                        && pending_t3 > pending_t1))
+            {
+                let last = io.state.nudge.shown_by_tier.get(&3).copied().unwrap_or(0);
+                if last == 0 || ctx.token_count.saturating_sub(last) >= growth_floor {
+                    injected = Some(3);
+                    reason = if t3_count_ready {
+                        format!(
+                            "T3 condense ready: {t3_count} tier-2 blocks >= tier3Trigger {} ({pending_t3} tokens), usage {usage_pct}%",
+                            cfg.tiers.tier3_trigger
+                        )
+                    } else {
+                        let suffix = if t3_pinned { "" } else { " (1.5x)" };
+                        format!(
+                            "T3 condense ready: {t3_count} tier-2 blocks ({pending_t3} tokens) >= {}{suffix} and > T2 {pending_t2} and > T1 effective {pending_t1}, usage {usage_pct}%",
+                            tier_thresholds[2]
+                        )
+                    };
+                }
+            }
         }
 
-        let emergency = usage >= cfg.nudge.emergency_threshold_pct;
-        let should_inject = emergency || reasons.is_empty();
+        let should_inject = injected.is_some();
+        if should_inject && first_sight_mass_ready {
+            reason.push_str(" [first-sight mass]");
+        }
 
         // The decision is always returned, not just when it fires: a host that
         // only learns about a *yes* cannot show the user "there is 40K to fold
         // but we are waiting", and cannot explain why nothing happened.
-        let (reason, tier) = if emergency {
-            ("emergency".to_string(), Some(crate::state::Tier::T3))
-        } else if should_inject {
-            let tier = if usage >= cfg.nudge.max_context_limit_pct {
-                crate::state::Tier::T2
+        if injected.is_none() {
+            if pressure {
+                let label = if emergency { "EMERGENCY" } else { "OVER-LIMIT" };
+                reason = if pending == 0 {
+                    format!(
+                        "{label}: usage {usage_pct}% but no tier has effective compressible content (T1 effective {pending_t1}, T2 {pending_t2}, T3 {pending_t3}) — nudge suppressed to avoid offering ranges below minCompressRange"
+                    )
+                } else {
+                    format!(
+                        "{label}: usage {usage_pct}% but max pending {pending} < min benefit {min_pressure_benefit} tokens (T1 effective {pending_t1}, T2 {pending_t2}, T3 {pending_t3}) — suppressed: rewriting below the benefit floor reclaims almost nothing while usage stays high; truncate.threshold remains the safety valve"
+                    )
+                };
             } else {
-                crate::state::Tier::T1
-            };
-            ("growth".to_string(), Some(tier))
-        } else {
-            (reasons.join("; "), None)
-        };
+                let eligible: Vec<u8> = if tiers_enabled { vec![1, 2, 3] } else { vec![1] };
+                let mass_of = |t: u8| match t {
+                    1 => pending_t1,
+                    2 => pending_t2,
+                    _ => pending_t3,
+                };
+                let count_ready = |t: u8| match t {
+                    2 => t2_count_ready,
+                    3 => t3_count_ready,
+                    _ => false,
+                };
+                let shown = |t: u8| io.state.nudge.shown_by_tier.get(&t).copied().unwrap_or(0);
+                let ready: Vec<String> = eligible
+                    .iter()
+                    .filter(|&&t| mass_of(t) >= tier_thresholds[(t - 1) as usize])
+                    .map(|&t| format!("T{t} {}", mass_of(t)))
+                    .collect();
+                let ready_count: Vec<String> = eligible
+                    .iter()
+                    .filter(|&&t| mass_of(t) < tier_thresholds[(t - 1) as usize] && count_ready(t))
+                    .map(|&t| {
+                        format!(
+                            "T{t} {} blocks (count)",
+                            if t == 2 { t2_count } else { t3_count }
+                        )
+                    })
+                    .collect();
+                let ready_all: Vec<String> = ready.into_iter().chain(ready_count).collect();
+                let ready_hint = if ready_all.is_empty() {
+                    String::new()
+                } else {
+                    format!(", ready: {}", ready_all.join(", "))
+                };
+                let blocked: Vec<String> = eligible
+                    .iter()
+                    .filter(|&&t| {
+                        (mass_of(t) >= tier_thresholds[(t - 1) as usize] || count_ready(t))
+                            && shown(t) > 0
+                            && ctx.token_count.saturating_sub(shown(t)) < growth_floor
+                    })
+                    .map(|&t| format!("T{t} (cadence)"))
+                    .collect();
+                let blocked_hint = if blocked.is_empty() {
+                    String::new()
+                } else {
+                    format!(", blocked: {}", blocked.join(", "))
+                };
+                // The floor below which NO tier can fire by mass.
+                let min_tier_threshold = tier_thresholds[0]
+                    .min(tier_thresholds[1])
+                    .min(tier_thresholds[2]);
+                let mut parts: Vec<String> = Vec::new();
+                if pending < min_tier_threshold {
+                    parts.push(format!(
+                        "max compressible {pending} < threshold {min_tier_threshold}"
+                    ));
+                }
+                if growth < growth_floor {
+                    parts.push(format!("growth {growth} < floor {growth_floor}"));
+                }
+                if parts.is_empty() {
+                    parts.push(format!("max compressible {pending}, growth {growth}"));
+                }
+                reason = format!("{}{ready_hint}{blocked_hint}", parts.join("; "));
+            }
+        }
+        let tier = injected.map(|t| match t {
+            1 => crate::state::Tier::T1,
+            2 => crate::state::Tier::T2,
+            _ => crate::state::Tier::T3,
+        });
 
         // Every nudge reference is a low-water mark: it rides DOWN with the
         // observed count but never up, so growth always measures the climb from
@@ -813,18 +1018,37 @@ impl Node for NudgeInject {
             }
         }
 
+        // The blocks the chosen tier would fold. Empty for T1, whose work is
+        // `ranges` instead — a host that receives a T2/T3 nudge names these
+        // block ids, and the kernel absorbs them into one block a tier up.
+        let tier_target_blocks: Vec<crate::ids::BlockId> = match injected {
+            Some(2) => t1_blocks.iter().map(|b| b.id).collect(),
+            Some(3) => t2_blocks.iter().map(|b| b.id).collect(),
+            _ => Vec::new(),
+        };
+
         io.effects.nudge = Some(super::Nudge {
             should_inject,
             reason,
             tier,
             context_usage: usage,
             ranges: io.effects.ranges.clone(),
+            tier_target_blocks,
             breakdown: super::NudgeBreakdown {
                 usage,
                 growth,
-                threshold: pool_threshold,
-                pending_t1: pending,
-                ..Default::default()
+                threshold: nudge_growth_tokens,
+                pending_t1,
+                pending_t2,
+                pending_t3,
+                max_pending: pending,
+                nudge_growth_tokens,
+                growth_floor,
+                growth_reference: reference,
+                effective_threshold,
+                min_pressure_benefit,
+                over_limit,
+                emergency,
             },
         });
     }

@@ -78,7 +78,7 @@ pub mod tokenizer;
 pub use config::{
     AbsorbConfig, CcrConfig, CharsAsTokens, CharsPerToken4, CompressConfig, Config, ConfigError,
     CrushConfig, DefaultPolicy, FnEstimator, ListPolicy, NudgeConfig, Policy, TierConfig,
-    TokenEstimator, TruncateConfig,
+    TierGrowthTokens, TokenEstimator, TruncateConfig,
 };
 pub use engine::{engine, nudge_instruction, Engine, Next, Step};
 pub use error::{RangeError, RangeErrorKind};

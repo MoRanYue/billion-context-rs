@@ -203,12 +203,43 @@ The first three do bookkeeping, the middle do the absorbing and folding, the las
 
 | Item | Value |
 |---|---|
-| tier2 / tier3 trigger | 1000 / 2000 tokens |
+| tier2 / tier3 trigger | 1000 / 2000 blocks |
+| tier growth | `nudgeGrowthTokens × 1.5` per tier |
 | nudge window | 45% – 75%, every 5 turns, forced from turn 15 |
 | Fold threshold | range ≥ 5000 chars, summary 50 – 20000 chars |
 | Recent kept | 3 messages / 5000 tokens |
 | Emergency truncation | 95% occupancy, hard cut after 3 consecutive failures |
 | Ref range | `m00001` – `m9999999`, `b1` – `b9999999` |
+
+### The three tiers
+
+Folding is LSM-shaped: each tier condenses the last. T1 folds **message
+ranges**; T2 folds **tier-1 blocks**; T3 folds **tier-2 blocks**. The nudge
+decides which tier to ask for and reports the ids to name:
+
+```rust,ignore
+let nudge = session.process_turn(input).nudge.expect("a decision");
+match nudge.tier {
+    // Fold these message spans.
+    Some(Tier::T1) => host.apply(nudge.ranges),
+    // Fold these block ids: one block a tier up, absorbing them.
+    Some(tier) => host.apply(nudge.tier_target_blocks),
+    None => {}
+}
+```
+
+A tier becomes ready on **two** axes, both of which must clear: enough blocks
+(`tiers.tier2_trigger`, `tiers.tier3_trigger`) and enough mass
+(`nudge.tier_growth_tokens`, defaulting to 1.5× `nudge_growth_tokens`). The
+count axis is what makes tier 2 reachable in a short session; the mass axis is
+what stops it collapsing four tiny blocks into one that reads worse than they
+did.
+
+A fold that names a block **absorbs** it: the inner block goes inactive, its
+summary becomes part of the outer block's compressed mass, and its originals
+stay reachable — `decompress` the outer block and the inner ones come back,
+`expand` walks the chain.
+
 
 ---
 

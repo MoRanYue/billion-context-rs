@@ -113,7 +113,7 @@ pub use inner::{from_json, load, save, to_json};
 #[cfg(feature = "serde")]
 mod tests {
     use super::*;
-    use crate::ids::MsgRef;
+    use crate::ids::{Boundary, MsgRef};
     use crate::state::{Block, Generation, State, Tier};
 
     fn sample() -> State {
@@ -136,7 +136,10 @@ mod tests {
             active: true,
             expanded: false,
             restored_inline: false,
-            span: Some((MsgRef::new(1).unwrap(), MsgRef::new(1).unwrap())),
+            span: Some((
+                Boundary::Message(MsgRef::new(1).unwrap()),
+                Boundary::Message(MsgRef::new(1).unwrap()),
+            )),
         });
         state
     }

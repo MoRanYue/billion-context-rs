@@ -128,6 +128,15 @@ pub enum Boundary {
     Block(BlockId),
 }
 
+impl std::fmt::Display for Boundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Boundary::Message(r) => r.fmt(f),
+            Boundary::Block(b) => b.fmt(f),
+        }
+    }
+}
+
 impl Boundary {
     /// `m00123` is a message, `b12` is a block. `None` for anything else: a
     /// host parsing a model's citation wants "not a boundary", not an error
@@ -148,7 +157,7 @@ impl Boundary {
 // second id space that has to be kept in sync forever.
 #[cfg(feature = "serde")]
 mod wire {
-    use super::{BlockId, MessageId, MsgRef};
+    use super::{BlockId, Boundary, MessageId, MsgRef};
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -172,6 +181,7 @@ mod wire {
 
     wire_id!(MsgRef, MsgRef::parse, "message ref");
     wire_id!(BlockId, BlockId::parse, "block id");
+    wire_id!(Boundary, Boundary::parse, "boundary");
 
     impl Serialize for MessageId {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {

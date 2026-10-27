@@ -15,12 +15,26 @@ pub struct TierConfig {
     pub tier3_trigger: u32,
 }
 
+/// Per-tier override of the token-mass threshold at which a tier becomes
+/// worth nudging for. Each unset tier keeps its derived default, so an absent
+/// struct decides byte-identically to one that was never configured.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TierGrowthTokens {
+    pub t1: Option<u32>,
+    pub t2: Option<u32>,
+    pub t3: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NudgeConfig {
     pub max_context_limit_pct: f32,
     pub min_context_limit_pct: f32,
+    /// Declared for parity with the reference config. **No node reads it** —
+    /// the reference implementation never reads it either.
     pub frequency: u32,
+    /// Same as `frequency`: carried so a config file round-trips, never read.
     pub iteration_threshold: u32,
     pub growth_ratio: f32,
     pub growth_floor: u32,
@@ -28,7 +42,17 @@ pub struct NudgeConfig {
     pub min_growth_floor: u32,
     pub min_growth_ratio: f32,
     pub emergency_threshold_pct: f32,
+    /// Multiplier for the shared T2/T3 token-mass threshold. Only consulted
+    /// when `tier_growth_tokens.{t2,t3}` are unset.
     pub tier2_growth_multiplier: f32,
+    pub tier_growth_tokens: Option<TierGrowthTokens>,
+    /// Minimum tokens the pressure band must be able to reclaim before it
+    /// injects. Below this, the rewrite reclaims almost nothing while high
+    /// usage keeps the band hot — each "success" resets the baselines and the
+    /// same nudge re-injects next turn (a zero-yield loop). `None` derives
+    /// `max(5_000, round(model_context_limit × 0.01))`; `Some(0)` restores the
+    /// legacy any-pending behaviour.
+    pub min_pressure_benefit_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +138,8 @@ impl Config {
                 min_growth_ratio: 0.45,
                 emergency_threshold_pct: 0.95,
                 tier2_growth_multiplier: 1.5,
+                tier_growth_tokens: None,
+                min_pressure_benefit_tokens: None,
             },
             truncate: TruncateConfig {
                 threshold: 0.95,
@@ -212,7 +238,13 @@ pub trait Policy: Send + Sync + 'static {
     }
 
     fn is_compress_tool(&self, name: &str) -> bool {
-        name == "compress"
+        // Both spellings, deliberately. The reference kernel's own tool is
+        // `compress`; this crate's `billion-context-tool` publishes the same
+        // tool as `acp_compress`. Recognising one and not the other made
+        // `HideCompressCalls` a silent no-op for every host using this
+        // workspace's own tool surface — the fold request stayed in the
+        // transcript as visible chatter.
+        name == "compress" || name == "acp_compress"
     }
 
     /// Virtual path for messages that are not tool exchanges, so one set of

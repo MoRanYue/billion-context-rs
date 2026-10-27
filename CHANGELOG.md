@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.5.0 — 2026-10-28
+
+### Added
+
+- **Tier arbitration is implemented.** Until now `Nudge` answered "should I ask
+  for a fold?" and always asked for a *tier-1* one; `config.tiers.*` was
+  declared, validated, and never read. The three-tier pyramid therefore existed
+  as bookkeeping — blocks carried a tier, but nothing could ever raise one.
+  A nudge now decides *which tier* to ask for: T1 folds messages, T2 condenses
+  tier-1 blocks, T3 condenses tier-2 ones. Readiness follows the reference
+  kernel on both axes — a tier needs enough blocks
+  (`tiers.tier2Trigger` / `tiers.tier3Trigger`) and enough mass
+  (`nudge.tierGrowthTokens`, defaulting to 1.5× `nudgeGrowthTokens` for T2 and
+  T3), with the mass floor short-circuitable per tier.
+
+  This is what makes `decompress`, `expand` and `retrieve` reach past a
+  summary: before, a conversation could only ever be one deep.
+
+- `Nudge::tier_target_blocks` — the block ids the requested tier would fold.
+  Empty for a T1 nudge, whose work is `ranges`. A tier-2/3 nudge is actionable
+  precisely because the host names these ids in `apply_compression` instead of
+  message spans, and the kernel absorbs them into one block a tier up.
+
+- `NudgeBreakdown` gains `pending_t2`, `pending_t3`, `max_pending` and
+  `min_pressure_benefit`, so a host can see which tier won and why.
+
+- `config.nudge.min_pressure_benefit_tokens` and
+  `config.tiers.growth_tokens` are now read. The former gates the
+  "no viable compression" verdict that the terminal escape is built on; the
+  latter overrides the derived per-tier mass thresholds.
+
+- `Session::message_span_of` — expand a block to the message refs underneath,
+  following nested block boundaries.
+
+### Changed
+
+- **`Block::span` is `Option<(Boundary, Boundary)>`**, not `(MsgRef, MsgRef)`.
+  A span records the refs the caller named: folding `b3..b4` records `b3`/`b4`,
+  because that citation is what a later request has to match. Resolving it to
+  messages is now an explicit call (`message_span_of`), not a stored guess. This
+  is a source-breaking change for code that pattern-matched `span` as refs.
+
+- **A fold that absorbs blocks counts the summaries it hides, not the originals
+  underneath.** A tier-2 fold of two 1200-token blocks hides ~35 tokens of
+  summary, and that — not the 2400 tokens of already-hidden originals — is what
+  the block saves. `compressed_tokens` and `Applied::tokens_compressed` are
+  value-for-value what the reference kernel reports.
+
+- `Nudge::reason` is now a diagnostic sentence rather than the fixed
+  `"growth"` / `"over_band"` / `"emergency"` tokens, matching the reference
+  kernel. Branch on `Nudge::tier`, `breakdown` and `should_inject` instead.
+
+### Fixed
+
+- **`HideCompressCalls` never fired for this workspace's own tool surface.**
+  `Policy::is_compress_tool` recognised only `compress` — the reference
+  kernel's spelling — while `billion-context-tool` publishes the same tool as
+  `acp_compress`. A host that registered the crate's tools therefore kept every
+  fold request in the transcript as visible chatter, which is exactly the
+  duplicate the node exists to remove. Both spellings are recognised now.
+
+### Verification
+
+Differential harness vs the TypeScript kernel, three scenarios, 0 diffs:
+`scenario-a.json` (folding, retrieval, decompress, status),
+`scenario-tools.json` (parallel tool calls), and the new
+`scenario-tiers.json` (T1 → T2 → T3, block absorption, span reporting).
+
 ## 0.4.0 — 2026-10-27
 
 ### Fixed

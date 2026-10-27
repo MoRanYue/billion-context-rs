@@ -1,4 +1,4 @@
-﻿//! Differential harness: drives `billion-context` from a scenario JSON and emits the
+//! Differential harness: drives `billion-context` from a scenario JSON and emits the
 //! canonical transcript that `diff/run-ts.mts` emits for the same scenario.
 //!
 //!     cargo run --example diff_harness -- <scenario.json> <out.json>
@@ -106,9 +106,60 @@ fn main() {
     let sc: Value = serde_json::from_str(&raw).expect("scenario json");
     let limit = sc["contextLimit"].as_u64().unwrap() as u32;
 
+    // Config knobs the scenario may pin. Both harnesses read the same object so
+    // a tier scenario exercises identical arbitration on either side.
+    let mut cfg = Config::new(limit);
+    if let Some(c) = sc.get("config") {
+        if let Some(t) = c.get("tiers") {
+            if let Some(v) = t.get("enabled").and_then(Value::as_bool) {
+                cfg.tiers.enabled = v;
+            }
+            if let Some(v) = t.get("tier2Trigger").and_then(Value::as_u64) {
+                cfg.tiers.tier2_trigger = v as u32;
+            }
+            if let Some(v) = t.get("tier3Trigger").and_then(Value::as_u64) {
+                cfg.tiers.tier3_trigger = v as u32;
+            }
+        }
+        if let Some(n) = c.get("nudge") {
+            if let Some(v) = n.get("growthCap").and_then(Value::as_u64) {
+                cfg.nudge.growth_cap = v as u32;
+            }
+            if let Some(v) = n.get("growthFloor").and_then(Value::as_u64) {
+                cfg.nudge.growth_floor = v as u32;
+            }
+            if let Some(v) = n.get("maxContextLimitPct").and_then(Value::as_f64) {
+                cfg.nudge.max_context_limit_pct = v as f32;
+            }
+            if let Some(v) = n.get("tier2GrowthMultiplier").and_then(Value::as_f64) {
+                cfg.nudge.tier2_growth_multiplier = v as f32;
+            }
+            if let Some(v) = n.get("minPressureBenefitTokens").and_then(Value::as_u64) {
+                cfg.nudge.min_pressure_benefit_tokens = Some(v as u32);
+            }
+            if let Some(g) = n.get("tierGrowthTokens") {
+                let growth = cfg.nudge.tier_growth_tokens.get_or_insert_with(Default::default);
+                if let Some(v) = g.get("t1").and_then(Value::as_u64) {
+                    growth.t1 = Some(v as u32);
+                }
+                if let Some(v) = g.get("t2").and_then(Value::as_u64) {
+                    growth.t2 = Some(v as u32);
+                }
+                if let Some(v) = g.get("t3").and_then(Value::as_u64) {
+                    growth.t3 = Some(v as u32);
+                }
+            }
+        }
+        if let Some(v) = c.get("preserveRecentMessages").and_then(Value::as_u64) {
+            cfg.preserve_recent_messages = v as usize;
+        }
+        if let Some(v) = c.get("preserveRecentTokens").and_then(Value::as_u64) {
+            cfg.preserve_recent_tokens = v as u32;
+        }
+    }
     // The TS kernel never reconciles a resent original, so compare against the
     // same contract: prune + carrier (Send) with reconciliation off.
-    let mut session = Session::new(Config::new(limit)).with_reconcile(false);
+    let mut session = Session::new(cfg).with_reconcile(false);
     // Optional 4th argument "inject" swaps in a synthetic counter, mirroring the
     // TS side's `createCore({ countTokens })`. Identical arithmetic on both
     // sides proves the estimator reaches every counting site the same way.

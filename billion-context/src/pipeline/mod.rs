@@ -64,16 +64,41 @@ pub struct NudgeBreakdown {
     pub pending_t1: u32,
     pub pending_t2: u32,
     pub pending_t3: u32,
+    /// Best any tier can offer right now — what the decision actually compares
+    /// against the thresholds.
+    pub max_pending: u32,
+    /// The growth step derived from the context limit (`nudgeGrowthTokens`).
+    pub nudge_growth_tokens: u32,
+    /// The floor the growth must clear (`growthFloor`).
+    pub growth_floor: u32,
+    /// What the growth is measured from: the last shown nudge, else the
+    /// baseline, else the current count ("no history, so nothing has grown").
+    pub growth_reference: u32,
+    /// `nudgeGrowthTokens / 2` while a nudge is still unanswered, else the
+    /// full step. Reported for parity; the decision does not branch on it.
+    pub effective_threshold: u32,
+    /// Benefit floor for injecting in the pressure band.
+    pub min_pressure_benefit: u32,
+    pub over_limit: bool,
+    pub emergency: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Nudge {
     pub should_inject: bool,
-    /// `growth` | `over_band` | `emergency`. Stable machine-readable reasons.
+    /// Why this decision was made, in prose — the same sentence the reference
+    /// kernel reports (`T1 effective 60000 >= 50000, growth 0, usage 60%
+    /// [first-sight mass]`). Diagnostic, not a machine enum: the fields below
+    /// carry the numbers a host should branch on.
     pub reason: String,
     pub tier: Option<Tier>,
     pub context_usage: f32,
     pub ranges: Vec<Range>,
+    /// The blocks the injected tier would fold. Empty for a T1 nudge, whose
+    /// work is `ranges`. This is what makes a tier-2/3 nudge *actionable*: the
+    /// host names these block ids in `apply_compression` instead of message
+    /// spans, and the kernel absorbs them into one block a tier up.
+    pub tier_target_blocks: Vec<crate::ids::BlockId>,
     pub breakdown: NudgeBreakdown,
 }
 

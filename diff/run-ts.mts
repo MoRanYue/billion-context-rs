@@ -30,6 +30,23 @@ const synthetic = (text: string): number => {
 
 const core = createCore(inject ? { countTokens: synthetic } : undefined);
 const cfg = defaultConfig(sc.contextLimit);
+// Optional per-scenario overrides. The Rust harness reads the same object, so a
+// tier scenario pins identical arbitration on both sides.
+{
+  const c = sc.config ?? {};
+  if (c.tiers) Object.assign(cfg.tiers, c.tiers);
+  if (c.nudge) {
+    const { tierGrowthTokens, ...rest } = c.nudge;
+    Object.assign(cfg.nudge, rest);
+    if (tierGrowthTokens) cfg.nudge.tierGrowthTokens = { ...tierGrowthTokens };
+  }
+  if (c.preserveRecentMessages !== undefined) {
+    cfg.preserveRecentMessages = c.preserveRecentMessages;
+  }
+  if (c.preserveRecentTokens !== undefined) {
+    cfg.preserveRecentTokens = c.preserveRecentTokens;
+  }
+}
 let state = createInitialState();
 let lastView: M[] = [];
 // The host's own transcript, unrendered. `applyCompression` must see this, not

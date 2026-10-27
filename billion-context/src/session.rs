@@ -383,6 +383,7 @@ impl Session {
         }
 
         // Collect the refs this range covers.
+        let covered = self.state.covered_ids();
         let mut ids = Vec::new();
         let mut tokens = 0u32;
         let mut blocked = 0usize;
@@ -398,7 +399,12 @@ impl Session {
                 continue;
             }
             ids.push(id.clone());
-            tokens = tokens.saturating_add(self.state.token_snapshot.get(&r).copied().unwrap_or(0));
+            // What an active block already hides is not visible mass, so it
+            // cannot be what this fold saved: its summary is, added below.
+            if !covered.contains(id) {
+                tokens = tokens
+                    .saturating_add(self.state.token_snapshot.get(&r).copied().unwrap_or(0));
+            }
         }
         if ids.is_empty() {
             return Err((
@@ -427,7 +433,6 @@ impl Session {
 
         // Refuse to re-fold something an active block already owns — unless this
         // range *is* that block, which is exactly what absorption means.
-        let covered = self.state.covered_ids();
         if ids
             .iter()
             .any(|id| covered.contains(id) && !absorbed_ids.contains(id))
@@ -493,7 +498,7 @@ impl Session {
             active: true,
             expanded: false,
             restored_inline: false,
-            span: Some((start, end)),
+            span: Some((range.start, range.end)),
         };
         self.state.blocks.push(block);
         for b in &absorbed {
@@ -532,15 +537,61 @@ impl Session {
                 Ok(r)
             }
             Boundary::Block(b) => {
-                let block = self.state.block(b).ok_or_else(|| {
-                    (RangeErrorKind::UnknownRef, format!("{b} is not a known block"))
-                })?;
-                block.span.map(|span| if first { span.0 } else { span.1 }).ok_or_else(|| {
-                    (
-                        RangeErrorKind::UnknownRef,
-                        format!("{b} has no ref span to expand"),
-                    )
-                })
+                let (start, end) = self.message_span_of(b)?;
+                Ok(if first { start } else { end })
+            }
+        }
+    }
+
+    /// The message refs a block covers, following nested block boundaries down
+    /// to the messages underneath. A block folded from `b3..b4` declares that
+    /// span, so reaching the messages takes one more hop per tier.
+    pub fn message_span_of(
+        &self,
+        block: BlockId,
+    ) -> Result<(MsgRef, MsgRef), (RangeErrorKind, String)> {
+        self.span_at(block, 0)
+    }
+
+    fn span_at(
+        &self,
+        block: BlockId,
+        depth: u8,
+    ) -> Result<(MsgRef, MsgRef), (RangeErrorKind, String)> {
+        // A block whose span names itself would otherwise recurse forever.
+        if depth > 32 {
+            return Err((
+                RangeErrorKind::UnknownRef,
+                format!("{block} nests too deeply to expand"),
+            ));
+        }
+        let found = self
+            .state
+            .block(block)
+            .ok_or_else(|| (RangeErrorKind::UnknownRef, format!("{block} is not a known block")))?;
+        let Some((start, end)) = found.span else {
+            return Err((
+                RangeErrorKind::UnknownRef,
+                format!("{block} has no ref span to expand"),
+            ));
+        };
+        Ok((
+            self.end_of(start, true, depth)?,
+            self.end_of(end, false, depth)?,
+        ))
+    }
+
+    fn end_of(
+        &self,
+        boundary: Boundary,
+        first: bool,
+        depth: u8,
+    ) -> Result<MsgRef, (RangeErrorKind, String)> {
+        match boundary {
+            Boundary::Message(r) => Ok(r),
+            Boundary::Block(id) => {
+                let (start, end) = self.span_at(id, depth + 1)?;
+                Ok(if first { start } else { end })
             }
         }
     }
@@ -552,7 +603,7 @@ impl Session {
     pub fn retrieve(&self, refs: &[MsgRef]) -> Vec<Retrieval> {
         let mut out = Vec::new();
         for block in self.state.active_blocks() {
-            let Some((start, end)) = block.span else {
+            let Ok((start, end)) = self.message_span_of(block.id) else {
                 continue;
             };
             if refs.iter().any(|r| *r >= start && *r <= end) {
@@ -561,7 +612,7 @@ impl Session {
                     tier: block.tier,
                     topic: block.topic.clone(),
                     summary: block.summary.clone(),
-                    span: block.span,
+                    span: Some((start, end)),
                 });
             }
         }
@@ -718,6 +769,83 @@ mod tests {
     use super::*;
     use crate::config::CharsAsTokens;
     use crate::message::Role;
+
+    /// The whole point of the pyramid: a fold that names a block absorbs it, so
+    /// tier 2 condenses tier-1 summaries and tier 3 condenses tier-2 ones. The
+    /// derived tier, the absorption list and the compressed mass all have to
+    /// agree, or the pyramid is decoration.
+    #[test]
+    fn the_tier_ladder_absorbs_blocks_upward() {
+        let mut config = Config::new(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        config.tiers.tier2_trigger = 1;
+        config.tiers.tier3_trigger = 2;
+        config.nudge.tier_growth_tokens = Some(crate::config::TierGrowthTokens {
+            t1: Some(1),
+            t2: Some(1),
+            t3: Some(1),
+        });
+        let mut s = Session::new(config).with_estimator(CharsAsTokens);
+        let msgs = conversation(8, 2_000);
+        let _ = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let fold = |s: &mut Session, start: Boundary, end: Boundary, topic: &str| {
+            let applied = s.apply_compression(CompressRequest {
+                ranges: vec![RequestedRange {
+                    start,
+                    end,
+                    topic: Some(topic.into()),
+                    summary: format!(
+                        "The user asked about {topic} and the assistant answered in full detail."
+                    ),
+                }],
+                now: 2,
+            });
+            assert!(applied.is_ok(), "{:?}", applied.errors);
+            applied.blocks[0]
+        };
+        let m = |n: u32| Boundary::Message(MsgRef::new(n).unwrap());
+        let b1 = fold(&mut s, m(1), m(4), "the parser");
+        let b2 = fold(&mut s, m(5), m(8), "the cache");
+        assert_eq!(s.state.block(b1).unwrap().tier, Tier::T1);
+
+        let t2 = fold(&mut s, Boundary::Block(b1), Boundary::Block(b1), "front end");
+        let t2b = fold(&mut s, Boundary::Block(b2), Boundary::Block(b2), "back end");
+        let tier_two = s.state.block(t2).unwrap();
+        assert_eq!(tier_two.tier, Tier::T2);
+        assert_eq!(tier_two.direct_blocks, vec![b1]);
+        assert!(!s.state.block(b1).unwrap().active, "absorbed blocks retire");
+        // The declared span is what the model cited, not what it expands to.
+        assert_eq!(
+            tier_two.span,
+            Some((Boundary::Block(b1), Boundary::Block(b1)))
+        );
+        // A tier-2 fold saves the summary mass it hides, not the originals the
+        // tier-1 block already accounted for.
+        assert!(
+            tier_two.compressed_tokens < 100,
+            "condensing a block must count the summary, got {}",
+            tier_two.compressed_tokens
+        );
+
+        let t3 = fold(&mut s, Boundary::Block(t2), Boundary::Block(t2b), "pipeline");
+        let tier_three = s.state.block(t3).unwrap();
+        assert_eq!(tier_three.tier, Tier::T3);
+        assert_eq!(tier_three.direct_blocks, vec![t2, t2b]);
+        assert_eq!(
+            tier_three.span,
+            Some((Boundary::Block(t2), Boundary::Block(t2b)))
+        );
+        // Expanding a tier-3 block still reaches the original messages.
+        let (start, end) = s.message_span_of(t3).unwrap();
+        assert_eq!((start.index(), end.index()), (1, 8));
+    }
 
     fn session() -> Session {
         Session::new(Config::new(200_000)).with_estimator(CharsAsTokens)

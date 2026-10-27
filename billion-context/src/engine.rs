@@ -254,8 +254,13 @@ mod tests {
             now: 1,
         });
         let nudge = step.nudge.expect("growth of 60k over a 100k window must nudge");
-        assert_eq!(nudge.reason, "growth");
+        assert_eq!(nudge.tier, Some(Tier::T1));
+        assert!(nudge.reason.starts_with("T1 effective "));
         assert!(!nudge.ranges.is_empty());
+        assert!(
+            nudge.tier_target_blocks.is_empty(),
+            "a tier-1 nudge points at ranges, not blocks"
+        );
         // The instruction is prepended as its own message, not merged into a
         // user turn: it must not look like the user said it.
         assert_eq!(step.messages[0].id.as_str(), "acp_nudge");
@@ -354,6 +359,7 @@ mod tests {
                 chars: 40_000,
             }],
             breakdown: Default::default(),
+            tier_target_blocks: Vec::new(),
         };
         let text = nudge_instruction(&nudge);
         assert!(text.contains("m00001"));
