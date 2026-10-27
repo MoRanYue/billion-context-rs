@@ -54,6 +54,14 @@ pub struct Range {
     pub count: usize,
     pub tokens: u32,
     pub chars: usize,
+    /// Of `tokens`, the share carried by tool calls and tool results.
+    pub tool_tokens: u32,
+    /// Of `tokens`, the share carried by prose (user and assistant text).
+    pub text_tokens: u32,
+    /// How many user turns the range contains. A range of pure tool chatter and
+    /// a range of user requirements look identical by size and are not: folding
+    /// the second one is what loses the task.
+    pub user_msgs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,6 +108,12 @@ pub struct Nudge {
     /// spans, and the kernel absorbs them into one block a tier up.
     pub tier_target_blocks: Vec<crate::ids::BlockId>,
     pub breakdown: NudgeBreakdown,
+    /// The usage the decision was made at, in the numbers the model is told. Kept
+    /// on the decision rather than recomputed by the renderer: a host that renders
+    /// its own text must be able to state the same figures, and a renderer that
+    /// re-derived them could disagree with the decision it is explaining.
+    pub token_count: u32,
+    pub model_context_limit: u32,
 }
 
 #[derive(Clone, Debug)]

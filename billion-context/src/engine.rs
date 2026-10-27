@@ -20,7 +20,9 @@
 //! place will loop forever otherwise, and every round is a real API call.
 
 use crate::config::Config;
+use crate::nudge::{render_nudge_text, Protocol, RenderedNudge};
 use crate::pipeline::Nudge;
+use crate::prompts::Prompts;
 use crate::session::{Applied, CompressRequest, Session, Turn, TurnInput};
 
 /// What the host should do with the step it was handed.
@@ -50,6 +52,8 @@ pub struct Engine {
     session: Session,
     round: usize,
     max_rounds: usize,
+    prompts: Prompts,
+    protocol: Option<Protocol>,
 }
 
 impl Engine {
@@ -58,11 +62,28 @@ impl Engine {
             session,
             round: 0,
             max_rounds: 10,
+            prompts: Prompts::canonical(),
+            protocol: None,
         }
     }
 
     pub fn with_max_rounds(mut self, rounds: usize) -> Self {
         self.max_rounds = rounds.max(1);
+        self
+    }
+
+    /// Replace the compression rule texts the nudge carries. See
+    /// [`crate::prompts::Prompts::resolve`] — the risk is the caller's to accept.
+    pub fn with_prompts(mut self, prompts: Prompts) -> Self {
+        self.prompts = prompts;
+        self
+    }
+
+    /// Declare the wire protocol of the lane. Anthropic-shaped lanes get one extra
+    /// sentence: without it the model answers in `<summary>` tags, ends the turn,
+    /// and the loop stalls waiting for a tool call that never comes.
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = Some(protocol);
         self
     }
 
@@ -141,13 +162,13 @@ impl Engine {
         // decision itself — not on the decision being present.
         if let Some(ref nudge) = nudge {
             if nudge.should_inject {
-                let instruction = nudge_instruction(nudge);
+                let instruction = self.render(nudge);
                 messages.insert(
                     0,
                     crate::message::Message::text(
                         "acp_nudge",
                         crate::message::Role::System,
-                        instruction,
+                        instruction.text,
                     ),
                 );
             }
@@ -158,40 +179,35 @@ impl Engine {
             nudge,
         }
     }
+
+    /// Render the instruction for this decision with the engine's prompt set and
+    /// protocol. Public so a host that owns the message list can render the same
+    /// bytes without going through [`Engine::step`].
+    pub fn render(&self, nudge: &Nudge) -> RenderedNudge {
+        render_nudge_text(
+            nudge,
+            self.session.state(),
+            &self.prompts,
+            self.protocol,
+        )
+    }
 }
 
 /// The text the model is shown when the engine wants it to fold something.
 ///
-/// Written as a peer instruction rather than a policy statement: models comply
-/// far more reliably with "these ranges are large, fold them" than with a wall
-/// of rules, and the ranges are concrete refs the model can cite verbatim.
+/// This is a convenience wrapper over [`render_nudge_text`] with the canonical
+/// rules and no declared protocol, for hosts that want the text but drive the
+/// message list themselves. It cannot see live blocks, so a tier-2/3 decision
+/// renders its target ids without their sizes — prefer [`Engine::render`] when a
+/// session is available.
 pub fn nudge_instruction(nudge: &Nudge) -> String {
-    let mut out = String::new();
-    out.push_str("## Context notice\n\n");
-    out.push_str(&format!(
-        "This conversation occupies {:.0}% of the context window.\n",
-        nudge.context_usage * 100.0
-    ));
-    match nudge.reason.as_str() {
-        "emergency" => out.push_str(
-            "This is urgent: the window is nearly full and the oldest messages \
-             will start being dropped.\n",
-        ),
-        "over_band" => out.push_str("The conversation is now above the comfortable range.\n"),
-        _ => out.push_str("The conversation has grown since the last fold.\n"),
-    }
-    out.push_str("\nFold the following ranges with the `compress` tool:\n\n");
-    for range in &nudge.ranges {
-        out.push_str(&format!(
-            "- `{}`–`{}` ({} messages, ~{} tokens)\n",
-            range.start, range.end, range.count, range.tokens
-        ));
-    }
-    out.push_str(
-        "\nWrite a summary that preserves decisions, constraints, exact values \
-         and anything the conversation still depends on. Omit pleasantries.\n",
-    );
-    out
+    render_nudge_text(
+        nudge,
+        &crate::state::State::default(),
+        &Prompts::canonical(),
+        None,
+    )
+    .text
 }
 
 /// Convenience: a session with a validated config, or the errors that stopped it.
@@ -348,8 +364,8 @@ mod tests {
     fn nudge_instruction_names_the_ranges() {
         let nudge = Nudge {
             should_inject: true,
-            reason: "over_band".into(),
-            tier: Some(Tier::T2),
+            reason: "T2 effective 60000 >= 50000".into(),
+            tier: Some(Tier::T1),
             context_usage: 0.81,
             ranges: vec![crate::pipeline::Range {
                 start: MsgRef::new(1).unwrap(),
@@ -357,13 +373,20 @@ mod tests {
                 count: 4,
                 tokens: 12_000,
                 chars: 40_000,
+                tool_tokens: 12_000,
+                text_tokens: 0,
+                user_msgs: 1,
             }],
             breakdown: Default::default(),
             tier_target_blocks: Vec::new(),
+            token_count: 81_000,
+            model_context_limit: 100_000,
         };
         let text = nudge_instruction(&nudge);
         assert!(text.contains("m00001"));
         assert!(text.contains("81%"));
         assert!(text.contains("compress"));
+        // The rules travel with the nudge; that is the whole point of the port.
+        assert!(text.contains("KEEP VERBATIM"));
     }
 }

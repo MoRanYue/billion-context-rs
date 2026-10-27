@@ -401,6 +401,10 @@ struct Info {
     tokens: u32,
     chars: usize,
     is_user: bool,
+    /// True when the message carries tool content (call or result). The split is
+    /// reported to the model because "43K of tool output" and "43K of user
+    /// requirements" call for opposite decisions at the same size.
+    is_tool: bool,
     index: usize,
     gap_before: bool,
 }
@@ -413,6 +417,9 @@ struct Segment {
     count: usize,
     tokens: u32,
     chars: usize,
+    tool_tokens: u32,
+    text_tokens: u32,
+    user_msgs: usize,
     start_index: usize,
     end_index: usize,
 }
@@ -425,6 +432,9 @@ impl Segment {
             count: 1,
             tokens: info.tokens,
             chars: info.chars,
+            tool_tokens: if info.is_tool { info.tokens } else { 0 },
+            text_tokens: if info.is_tool { 0 } else { info.tokens },
+            user_msgs: usize::from(info.is_user),
             start_index: info.index,
             end_index: info.index,
         }
@@ -436,6 +446,9 @@ impl Segment {
         self.count += other.count;
         self.tokens += other.tokens;
         self.chars += other.chars;
+        self.tool_tokens += other.tool_tokens;
+        self.text_tokens += other.text_tokens;
+        self.user_msgs += other.user_msgs;
     }
 
     fn to_range(&self) -> Range {
@@ -445,6 +458,9 @@ impl Segment {
             count: self.count,
             tokens: self.tokens,
             chars: self.chars,
+            tool_tokens: self.tool_tokens,
+            text_tokens: self.text_tokens,
+            user_msgs: self.user_msgs,
         }
     }
 }
@@ -527,6 +543,10 @@ impl Node for Recommend {
                     .unwrap_or_else(|| ctx.estimator.count(sized)),
                 chars: sized.chars().count(),
                 is_user: msg.role == Role::User,
+                is_tool: matches!(
+                    msg.content,
+                    Content::ToolCall { .. } | Content::ToolResult { .. }
+                ),
                 index,
                 gap_before: gap,
             });
@@ -645,6 +665,9 @@ impl Node for Recommend {
                         last.count += tail.count;
                         last.tokens += tail.tokens;
                         last.chars += tail.chars;
+                        last.tool_tokens += tail.tool_tokens;
+                        last.text_tokens += tail.text_tokens;
+                        last.user_msgs += tail.user_msgs;
                     }
                     _ if batch_chars >= min_chars => ranges.push(tail.to_range()),
                     // Nothing precedes it, so the whole remainder is below the
@@ -1050,6 +1073,8 @@ impl Node for NudgeInject {
                 over_limit,
                 emergency,
             },
+            token_count: ctx.token_count,
+            model_context_limit: cfg.model_context_limit,
         });
     }
 }

@@ -67,8 +67,10 @@ pub mod engine;
 pub mod error;
 pub mod ids;
 pub mod message;
+pub mod nudge;
 pub mod persist;
 pub mod pipeline;
+pub mod prompts;
 pub mod recommend;
 pub mod session;
 pub mod state;
@@ -84,9 +86,14 @@ pub use engine::{engine, nudge_instruction, Engine, Next, Step};
 pub use error::{RangeError, RangeErrorKind};
 pub use ids::{BlockId, Boundary, MessageId, MsgRef, Timestamp};
 pub use message::{strip_ref_tag, Content, ContentKind, Message, Role};
+pub use nudge::{render_nudge_text, Protocol, RenderedNudge, Voice, ONE_CALL_HINT};
 pub use pipeline::{
     default_pipeline, pipeline_names, Effects, Node, NodeIo, Nudge, NudgeBreakdown, PipelineContext,
     Range, RenderStrategy, TerminalEscape, ViewMode,
+};
+pub use prompts::{
+    Prompts, PromptsOverrides, RiskAcknowledged, COMPRESS_PHILOSOPHY, HOW_TO_COMPRESS_RULES,
+    LANGUAGE_PRESERVATION_RULE, TIER2_DISTILL_RULES, TIER3_CONDENSE_RULES,
 };
 pub use session::{
     Applied, CompressRequest, DecompressOutcome, Hit, RequestedRange, Retrieval, Session, Status,
