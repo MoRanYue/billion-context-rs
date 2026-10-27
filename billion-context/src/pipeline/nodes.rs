@@ -1101,9 +1101,18 @@ impl Node for NudgeInject {
 // 13. emergency-truncate
 // ---------------------------------------------------------------------------
 
-/// The last safety valve. Drops the oldest unprotected, ref-bearing messages
-/// until the estimated occupancy falls back under the threshold, and surfaces a
-/// terminal warning if it has to do that repeatedly.
+/// The last safety valve: clip oversized payloads, never delete messages.
+///
+/// Deleting was what this used to do, oldest first. It destroyed the task
+/// statement first, could cut a tool call away from its result, and was
+/// unrecoverable — so a transient estimate spike cost permanent history. Clipping
+/// keeps every message, keeps the order, and leaves both ends of the payload
+/// visible. See [`crate::truncate`].
+///
+/// A latch replays the previous turn's clips. Without it, a host that resends the
+/// original bytes (or a render that reads them from the transcript) would
+/// re-inflate everything the last turn freed, and the session would oscillate
+/// against its own relief valve every single turn.
 pub struct EmergencyTruncate;
 
 impl Node for EmergencyTruncate {
@@ -1112,58 +1121,125 @@ impl Node for EmergencyTruncate {
     }
 
     fn run(&self, io: &mut NodeIo<'_>, ctx: &PipelineContext<'_>) {
+        use crate::state::{TruncateLatch, MAX_TRUNCATE_LATCH};
+
         let cfg = ctx.config;
         if cfg.model_context_limit == 0 {
             return;
         }
+
+        // Replay first, before the watermark check. A resend that reinstated the
+        // full payload must be clipped back even if the estimate happens to sit
+        // below the threshold this turn — otherwise the bytes come back the moment
+        // the number dips, and the next turn pays for them again.
+        if !io.state.nudge.truncate_latch.is_empty() {
+            let latched = std::mem::take(&mut io.state.nudge.truncate_latch);
+            let mut keep = Vec::with_capacity(latched.len());
+            for latch in latched {
+                let Some(id) = io.state.refs.raw_of(latch.r).cloned() else {
+                    continue;
+                };
+                let Some(index) = io.messages.iter().position(|m| m.id == id) else {
+                    continue;
+                };
+                let current = io.messages[index].content.body().unwrap_or_default();
+                if current.len() <= latch.text.len() {
+                    // Same or shorter than what we clipped to: nothing to forgive.
+                    continue;
+                }
+                io.messages[index] = io.messages[index].clone().with_body(&latch.text);
+                keep.push(latch);
+            }
+            io.state.nudge.truncate_latch = keep;
+        }
+
         let usage = ctx.token_count as f32 / cfg.model_context_limit as f32;
         if usage < cfg.truncate.threshold {
             io.state.nudge.consecutive_truncations = 0;
+            io.state.nudge.terminal_streak = 0;
             return;
         }
 
-        let mut budget =
-            ((usage - cfg.truncate.threshold) * cfg.model_context_limit as f32).ceil() as u32;
-        let mut removed = 0usize;
-        {
-            let refs = &io.state.refs;
-            let snapshot = &io.state.token_snapshot;
-            let policy = ctx.policy;
-            io.messages.retain(|m| {
-                if budget == 0 || policy.is_message_protected(m) {
-                    return true;
-                }
-                let Some(r) = refs.ref_of(&m.id) else {
-                    return true;
-                };
-                let tokens = snapshot.get(&r).copied().unwrap_or(0);
-                if tokens == 0 {
-                    return true;
-                }
-                budget = budget.saturating_sub(tokens);
-                removed += 1;
-                false
+        let counter = ctx.estimator;
+        let estimate = |text: &str| counter.count(text);
+        let options = crate::truncate::TruncateOptions {
+            protect_recent_messages: cfg.preserve_recent_messages,
+            ..crate::truncate::TruncateOptions::default()
+        };
+        let protected = |m: &Message| ctx.policy.is_message_protected(m);
+        let outcome = crate::truncate::truncate_large_payloads(
+            io.messages,
+            ctx.token_count,
+            cfg,
+            &estimate,
+            &options,
+            &protected,
+        );
+        let saved = outcome.saved_tokens;
+
+        for (id, text) in &outcome.replacements {
+            let Some(r) = io.state.refs.ref_of(id) else {
+                continue;
+            };
+            io.state.nudge.truncate_latch.push(TruncateLatch {
+                r,
+                text: text.clone(),
             });
         }
-
-        if removed == 0 {
-            io.effects.truncation_skipped =
-                Some("over threshold but nothing foldable could be dropped".into());
-            return;
+        if io.state.nudge.truncate_latch.len() > MAX_TRUNCATE_LATCH {
+            let excess = io.state.nudge.truncate_latch.len() - MAX_TRUNCATE_LATCH;
+            io.state.nudge.truncate_latch.drain(..excess);
+        }
+        if !outcome.replacements.is_empty() {
+            *io.messages = outcome.messages;
         }
 
-        io.state.nudge.consecutive_truncations += 1;
-        if io.state.nudge.consecutive_truncations >= cfg.truncate.terminal_escape_after {
+        // "Nothing to free" has two very different causes, and only one of them is
+        // terminal. No foldable range at all means the conversation is structurally
+        // uncompressible; a fold that exists but freed nothing means the estimator
+        // and the payloads disagree. The second self-heals, the first does not.
+        let no_viable_fold = io
+            .effects
+            .nudge
+            .as_ref()
+            .map(|n| n.breakdown.max_pending == 0 || n.ranges.is_empty())
+            .unwrap_or(true);
+        let stuck = no_viable_fold && saved == 0;
+
+        io.state.nudge.consecutive_truncations = if saved > 0 {
+            0
+        } else {
+            io.state.nudge.consecutive_truncations.saturating_add(1)
+        };
+        io.state.nudge.terminal_streak = if stuck {
+            io.state.nudge.terminal_streak.saturating_add(1)
+        } else {
+            0
+        };
+
+        if io.state.nudge.terminal_streak >= cfg.truncate.terminal_escape_after {
+            io.state.nudge.consecutive_truncations = 0;
             io.effects.terminal = Some(super::TerminalEscape {
                 message: format!(
-                    "context is still at {:.0}% after {removed} messages were dropped; \
-                     start a new conversation or fold more aggressively",
-                    usage * 100.0
+                    "context is still at {:.0}% after {} truncation attempt(s) freed nothing; \
+                     start a new conversation or raise the context limit",
+                    usage * 100.0,
+                    io.state.nudge.terminal_streak
                 ),
                 usage,
                 token_count: ctx.token_count,
                 model_context_limit: cfg.model_context_limit,
+                stuck_events: io.state.nudge.terminal_streak,
             });
+            return;
+        }
+
+        if saved == 0 {
+            io.effects.truncation_skipped = Some(format!(
+                "over the truncation watermark but nothing could be clipped: \
+                 {} candidate payload(s) found",
+                outcome.candidates_found
+            ));
         }
     }
 }

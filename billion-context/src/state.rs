@@ -145,6 +145,26 @@ pub struct Stats {
     pub retrieval_count: u64,
 }
 
+/// A payload the kernel clipped, kept so a resend of the original bytes can be
+/// clipped again instead of reinstating the whole thing.
+///
+/// Keyed by ref, not by message id: a host that resends its transcript renames
+/// every message, but the ref survives because it is the kernel's own name for
+/// that content.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TruncateLatch {
+    pub r: MsgRef,
+    /// Exactly the bytes the kernel substituted. A resend that is longer than
+    /// this has been re-inflated by the host and must be clipped back to it.
+    pub text: String,
+}
+
+/// Bounded latch list. Unbounded, it grows by one entry per clipped payload per
+/// turn — a slow leak that only shows up on a very long session, which is exactly
+/// the session that cannot afford it.
+pub const MAX_TRUNCATE_LATCH: usize = 64;
+
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NudgeState {
@@ -152,6 +172,11 @@ pub struct NudgeState {
     pub baseline_tokens: u32,
     pub shown_by_tier: HashMap<u8, u32>,
     pub consecutive_truncations: u32,
+    /// Turns in a row where truncation ran and could not free anything. Freed on
+    /// its own terms, this number is the difference between "keep trying" and
+    /// "stop, the situation is terminal".
+    pub terminal_streak: u32,
+    pub truncate_latch: Vec<TruncateLatch>,
 }
 
 /// The whole mutable state of one conversation: serializable, clonable, and

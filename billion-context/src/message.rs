@@ -307,11 +307,21 @@ impl Message {
         self
     }
 
+    /// Replace the message's text payload, keeping its identity, role and flags.
+    ///
+    /// This is what truncation uses: pressure relief must not delete history, so
+    /// the message survives with a clipped body rather than disappearing. A
+    /// variant that carries no text is returned unchanged.
+    #[must_use]
+    pub fn with_body(mut self, body: &str) -> Self {
+        self.content = self.content.with_body(body);
+        self
+    }
+
     /// Whether folding this message would destroy bytes the host cannot give
     /// back. The recommender refuses to let any range span such a message.
     pub fn has_unrecoverable_payload(&self) -> bool {
-        self.unrecoverable_payload
-    }
+        self.unrecoverable_payload    }
 
     pub fn text(id: impl AsRef<str>, role: Role, text: impl AsRef<str>) -> Self {
         Self::new(id, role, Content::Text(Arc::from(text.as_ref())))

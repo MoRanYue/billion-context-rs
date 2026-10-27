@@ -122,6 +122,10 @@ pub struct TerminalEscape {
     pub usage: f32,
     pub token_count: u32,
     pub model_context_limit: u32,
+    /// Consecutive turns where truncation ran and freed nothing. The number is the
+    /// evidence: one stuck turn is a spike, several in a row means the window is
+    /// structurally too small for this conversation.
+    pub stuck_events: u32,
 }
 
 /// Everything a pass may tell the host. Kept separate from `State` because none

@@ -77,6 +77,7 @@ pub mod session;
 pub mod state;
 #[cfg(feature = "hf-tokenizer")]
 pub mod tokenizer;
+pub mod truncate;
 
 pub use config::{
     AbsorbConfig, CcrConfig, CharsAsTokens, CharsPerToken4, CompressConfig, Config, ConfigError,
@@ -284,18 +285,22 @@ mod integration_tests {
     }
 
     /// The safety valve: when the window is full and nothing is foldable, the
-    /// engine drops the oldest ref-bearing messages rather than letting the
-    /// request fail.
+    /// engine clips the oversized payload instead of deleting history.
+    ///
+    /// Deleting was the old behaviour and it was wrong in a way this test pins
+    /// down: the oldest message went first, and the oldest message is usually the
+    /// task statement.
     #[test]
-    fn emergency_truncate_fires_when_over_the_line() {
+    fn emergency_truncate_clips_and_keeps_the_task_statement() {
         let mut config = Config::new(1_000);
         config.truncate.threshold = 0.9;
-        config.preserve_recent_messages = 1;
+        config.preserve_recent_messages = 0;
         let mut session = Session::new(config).with_estimator(CharsAsTokens);
 
-        let history: Vec<Message> = (0..6)
-            .map(|i| Message::text(format!("t{i}"), Role::User, "w".repeat(400)))
-            .collect();
+        let history = vec![
+            Message::text("u0", Role::User, "the task statement"),
+            Message::tool_result("t1", "grep", "c1", "z".repeat(20_000)),
+        ];
 
         let turn = session.process_turn(TurnInput {
             messages: &history,
@@ -303,10 +308,20 @@ mod integration_tests {
             render: RenderStrategy::None,
             now: 1,
         });
-        assert!(
-            turn.messages.len() < history.len(),
-            "over the threshold, the oldest messages must go"
+        assert_eq!(
+            turn.messages.len(),
+            history.len(),
+            "pressure relief must not delete history"
         );
+        assert_eq!(turn.messages[0].id.as_str(), "u0");
+        assert_eq!(turn.messages[0].content.body().unwrap(), "the task statement");
+        let clipped = turn.messages[1].content.body().unwrap();
+        assert!(
+            clipped.contains(crate::truncate::TRUNCATION_MARKER),
+            "the oversized payload should carry the marker, got {clipped:?}"
+        );
+        assert!(clipped.len() < 20_000);
+        assert!(turn.truncation_skipped.is_none());
     }
 
     /// The kernel must never rewrite a provider's signed reasoning payload:
