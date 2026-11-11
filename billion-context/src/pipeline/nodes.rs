@@ -359,8 +359,16 @@ impl Node for Filter {
     }
 
     fn run(&self, io: &mut NodeIo<'_>, _ctx: &PipelineContext<'_>) {
-        io.messages
-            .retain(|m| !(m.content.kind() == ContentKind::Text && m.content.is_empty_text()));
+        // A media message may have no text at all — an image with an empty
+        // caption is still the only handle to its bytes — so it survives the
+        // sweep that exists to drop blank prose. The same goes for a message the
+        // host flagged as payload it cannot restore: dropping it would silently
+        // remove the hole the recommender is supposed to respect.
+        io.messages.retain(|m| {
+            m.media.is_some()
+                || m.unrecoverable_payload
+                || !(m.content.kind() == ContentKind::Text && m.content.is_empty_text())
+        });
     }
 }
 

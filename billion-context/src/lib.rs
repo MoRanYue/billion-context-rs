@@ -87,7 +87,7 @@ pub use config::{
 pub use engine::{engine, nudge_instruction, Engine, Next, Step};
 pub use error::{RangeError, RangeErrorKind};
 pub use ids::{BlockId, Boundary, MessageId, MsgRef, Timestamp};
-pub use message::{strip_ref_tag, Content, ContentKind, Message, Role};
+pub use message::{strip_ref_tag, Content, ContentKind, MediaMeta, MediaSource, Message, Role};
 pub use nudge::{render_nudge_text, Protocol, RenderedNudge, Voice, ONE_CALL_HINT};
 pub use pipeline::{
     default_pipeline, pipeline_names, Effects, Node, NodeIo, Nudge, NudgeBreakdown, PipelineContext,

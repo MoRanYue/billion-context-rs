@@ -140,6 +140,7 @@ mod tests {
                 Boundary::Message(MsgRef::new(1).unwrap()),
                 Boundary::Message(MsgRef::new(1).unwrap()),
             )),
+            compress_call_id: None,
         });
         state
     }

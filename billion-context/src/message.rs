@@ -248,6 +248,121 @@ pub fn strip_ref_tag(text: &str) -> &str {
     rest.strip_prefix('\n').unwrap_or(rest)
 }
 
+// ---------------------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------------------
+
+/// Where a media payload a message carries lives.
+///
+/// Facts only: the core never fetches, decodes or prices one. A host maps this
+/// from its wire crate (`billion_context_wire::MediaSource`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MediaSource {
+    /// The bytes ride in the request — base64, or a `data:` URL.
+    Inline,
+    /// A remote pointer. Keeping it alive is the host's business.
+    Url(Arc<str>),
+    /// A provider-side file id.
+    FileId(Arc<str>),
+}
+
+/// What a message carries besides text, and the one decision it changes.
+///
+/// One fact per message: when a message carries several payloads, this describes
+/// the first, while [`Message::has_unrecoverable_payload`] still accounts for
+/// all of them. A host that prices per image counts them on the wire, where the
+/// whole body is in hand.
+///
+/// The core holds **no bytes**: a message is cloned on every turn, and a base64
+/// payload would turn each clone into a megabyte-scale copy. It also holds no
+/// **price**: meters differ by provider, route and image size, so the number
+/// stays with the host, which can learn it from `usage`. The core's own token
+/// estimate is text-only on purpose — teaching it about pixels would mean
+/// teaching it about providers, which is exactly the knowledge this crate
+/// exists to keep out.
+///
+/// What the core does instead is mechanical, and is the part a host cannot do
+/// safely alone: a fold that would destroy unrecoverable media is refused (see
+/// [`Message::has_unrecoverable_payload`]), and media participates in the
+/// message's identity, so a resent original is still recognised when the image
+/// is what changed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MediaMeta {
+    /// IANA media type, when the wire named one. Never guessed.
+    pub mime: Option<Arc<str>>,
+    /// Decoded payload size, when known without fetching.
+    pub byte_len: Option<u64>,
+    /// Pixel dimensions, when the payload's header disclosed them.
+    pub dimensions: Option<(u32, u32)>,
+    pub source: MediaSource,
+    /// Whether a fold can hand the payload back. Take it from
+    /// `billion_context_wire::MediaInfo::recoverable`, which is exactly
+    /// `!Block::has_unrecoverable_payload()`: two spellings of one verdict, so
+    /// a host cannot record a recoverability the fold rule disagrees with.
+    pub recoverable: bool,
+    /// The host's own key for the original bytes — a spill file, a content
+    /// hash. The core only carries it, so a host that persists its state can
+    /// find the bytes again after a restart. The core never invents one, and
+    /// not every host needs one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub handle: Option<Arc<str>>,
+}
+
+impl MediaMeta {
+    /// One line a host may render where the payload used to be, e.g.
+    /// `[image image/png 1024x768 1.5MB]`.
+    ///
+    /// The kernel never inserts this itself: a note changes the bytes the model
+    /// reads, which is wire format — the host's call, not the kernel's.
+    pub fn describe(&self) -> String {
+        let mut line = String::from("[");
+        line.push_str(self.kind());
+        if let Some(mime) = &self.mime {
+            line.push(' ');
+            line.push_str(mime);
+        }
+        if let Some((w, h)) = self.dimensions {
+            line.push_str(&format!(" {w}x{h}"));
+        }
+        if let Some(bytes) = self.byte_len {
+            line.push(' ');
+            line.push_str(&human_bytes(bytes));
+        }
+        if !self.recoverable {
+            line.push_str(", not recoverable");
+        }
+        line.push(']');
+        line
+    }
+
+    /// A coarse label from the media type alone — enough to say what
+    /// disappeared without pretending to know more than the wire did.
+    fn kind(&self) -> &'static str {
+        match self.mime.as_deref() {
+            Some(m) if m.starts_with("image/") => "image",
+            Some("application/pdf") => "document",
+            Some(m) if m.starts_with("audio/") => "audio",
+            Some(m) if m.starts_with("video/") => "video",
+            _ => "media",
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let n = bytes as f64;
+    if n < KB {
+        format!("{bytes}B")
+    } else if n < MB {
+        format!("{:.1}KB", n / KB)
+    } else {
+        format!("{:.1}MB", n / MB)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Message {
@@ -278,6 +393,14 @@ pub struct Message {
     /// [`Block::has_unrecoverable_payload`]: https://docs.rs/billion-context-wire
     #[cfg_attr(feature = "serde", serde(default))]
     pub unrecoverable_payload: bool,
+    /// Media this message carries besides its text, when the host recorded any.
+    ///
+    /// A `tool_result` may carry an image *and* the text that describes it, so
+    /// media rides beside `content` rather than inside it: a `Content` variant
+    /// could not express both, and adding one would break every host that
+    /// matches the enum exhaustively.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub media: Option<MediaMeta>,
 }
 
 impl Message {
@@ -289,6 +412,7 @@ impl Message {
             thinking_tokens: 0,
             summary_of_block: None,
             unrecoverable_payload: false,
+            media: None,
         }
     }
 
@@ -318,10 +442,42 @@ impl Message {
         self
     }
 
+    /// Attach media facts to this message. See [`MediaMeta`].
+    ///
+    /// ```
+    /// use billion_context::{MediaMeta, MediaSource, Message, Role};
+    ///
+    /// let meta = MediaMeta {
+    ///     mime: None,
+    ///     byte_len: Some(4),
+    ///     dimensions: None,
+    ///     source: MediaSource::Inline,
+    ///     recoverable: true,
+    ///     handle: None,
+    /// };
+    /// let msg = Message::text("u1", Role::User, "look").with_media(meta);
+    /// assert!(msg.media().is_some());
+    /// ```
+    #[must_use]
+    pub fn with_media(mut self, media: MediaMeta) -> Self {
+        self.media = Some(media);
+        self
+    }
+
+    /// The media this message carries, if any.
+    pub fn media(&self) -> Option<&MediaMeta> {
+        self.media.as_ref()
+    }
+
     /// Whether folding this message would destroy bytes the host cannot give
     /// back. The recommender refuses to let any range span such a message.
+    ///
+    /// Derived from the media facts when the host recorded them, so the flag
+    /// and [`MediaMeta::recoverable`] can never disagree; the explicit flag
+    /// still covers payloads the host could not describe.
     pub fn has_unrecoverable_payload(&self) -> bool {
-        self.unrecoverable_payload    }
+        self.unrecoverable_payload || self.media.as_ref().is_some_and(|m| !m.recoverable)
+    }
 
     pub fn text(id: impl AsRef<str>, role: Role, text: impl AsRef<str>) -> Self {
         Self::new(id, role, Content::Text(Arc::from(text.as_ref())))
@@ -407,6 +563,29 @@ impl Message {
             h = feed(h, call_id.as_bytes());
             h = feed(h, arguments.as_bytes());
         }
+        if let Some(media) = &self.media {
+            // Media is part of what a message *is*: two messages that differ
+            // only in the picture are different messages. Feed the facts, never
+            // the bytes — the handle is the host's key for those.
+            h = feed(
+                h,
+                match &media.source {
+                    MediaSource::Inline => b"i",
+                    MediaSource::Url(_) => b"r",
+                    MediaSource::FileId(_) => b"f",
+                },
+            );
+            if let Some(mime) = &media.mime {
+                h = feed(h, mime.as_bytes());
+            }
+            if let Some(len) = media.byte_len {
+                h = feed(h, &len.to_le_bytes());
+            }
+            if let Some((width, height)) = media.dimensions {
+                h = feed(h, &width.to_le_bytes());
+                h = feed(h, &height.to_le_bytes());
+            }
+        }
         h
     }
 }
@@ -442,5 +621,77 @@ mod tests {
         assert_eq!(prefixed.tool_arguments(), Some("<tag/>{}"));
         // It stays unfoldable: a summary may never rewrite arguments.
         assert_eq!(prefixed.foldable_text(), None);
+    }
+
+    fn meta(recoverable: bool) -> MediaMeta {
+        MediaMeta {
+            mime: Some(Arc::from("image/png")),
+            byte_len: Some(1_572_864),
+            dimensions: Some((1024, 768)),
+            source: MediaSource::Inline,
+            recoverable,
+            handle: None,
+        }
+    }
+
+    #[test]
+    fn media_note_states_only_what_the_wire_said() {
+        assert_eq!(meta(true).describe(), "[image image/png 1024x768 1.5MB]");
+        assert_eq!(
+            meta(false).describe(),
+            "[image image/png 1024x768 1.5MB, not recoverable]"
+        );
+        let bare = MediaMeta {
+            mime: None,
+            byte_len: None,
+            dimensions: None,
+            source: MediaSource::Url(Arc::from("https://example.com/a.png")),
+            recoverable: true,
+            handle: None,
+        };
+        assert_eq!(bare.describe(), "[media]");
+    }
+
+    #[test]
+    fn media_is_part_of_a_message_identity() {
+        let plain = Message::text("a", Role::User, "look");
+        let with_media = plain.clone().with_media(meta(true));
+        assert_ne!(plain.fingerprint(), with_media.fingerprint());
+        // The handle is the host's key to the bytes, not part of what the model
+        // sees, so it must not move the identity.
+        let handled = plain.clone().with_media(MediaMeta {
+            handle: Some(Arc::from("sha256:abc")),
+            ..meta(true)
+        });
+        assert_eq!(with_media.fingerprint(), handled.fingerprint());
+    }
+
+    #[test]
+    fn unrecoverable_media_is_derived_from_the_facts() {
+        assert!(!Message::text("a", Role::User, "x").has_unrecoverable_payload());
+        assert!(
+            !Message::text("a", Role::User, "x")
+                .with_media(meta(true))
+                .has_unrecoverable_payload()
+        );
+        assert!(
+            Message::text("a", Role::User, "x")
+                .with_media(meta(false))
+                .has_unrecoverable_payload()
+        );
+        // The explicit flag still covers payloads the host could not describe.
+        assert!(
+            Message::text("a", Role::User, "x")
+                .with_unrecoverable_payload(true)
+                .has_unrecoverable_payload()
+        );
+    }
+
+    #[test]
+    fn a_body_rewrite_keeps_the_media() {
+        let msg = Message::text("a", Role::User, "long body").with_media(meta(true));
+        let clipped = msg.with_body("short");
+        assert_eq!(clipped.content.body(), Some("short"));
+        assert!(clipped.media().is_some());
     }
 }

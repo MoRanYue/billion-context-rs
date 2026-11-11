@@ -1164,6 +1164,41 @@ mod tests {
         );
     }
 
+    /// The same hole, expressed the way a host holding wire facts expresses it:
+    /// no hand-set flag, just the media's own verdict.
+    #[test]
+    fn unrecoverable_media_facts_block_a_range_the_same_way() {
+        let mut s = session();
+        let mut msgs = conversation(8, 6_000);
+        msgs[3] = msgs[3].clone().with_media(crate::MediaMeta {
+            mime: Some("image/png".into()),
+            byte_len: Some(1_024),
+            dimensions: Some((32, 32)),
+            source: crate::MediaSource::Url("https://example.com/a.png".into()),
+            recoverable: false,
+            handle: None,
+        });
+
+        let turn = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 100,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let hole = MsgRef::new(4).expect("ref");
+        assert!(!turn.ranges.is_empty());
+        for range in &turn.ranges {
+            assert!(
+                !(range.start <= hole && hole <= range.end),
+                "range {}-{} spans un-restorable media",
+                range.start.index(),
+                range.end.index()
+            );
+        }
+        assert!(turn.messages[3].has_unrecoverable_payload());
+    }
+
     #[test]
     fn refs_are_assigned_and_never_reused() {
         let mut s = session();
