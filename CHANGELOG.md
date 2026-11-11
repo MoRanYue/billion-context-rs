@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.6.0 — 2026-11-11
+
+### Added
+
+- **Media facts in the IR.** `Message::media` carries a `MediaMeta`: media type,
+  byte length, pixel dimensions, whether the payload is inline bytes, a remote
+  URL or a provider file id, whether a fold can hand it back, and an optional
+  host key for the original bytes. It is a description, never the bytes — the
+  kernel still stores no payload and prices nothing.
+
+  `billion-context-wire::Block::media_info()` fills it from the wire in all four
+  protocols, including images that arrive inside a tool result, and takes its
+  `recoverable` verdict from `Block::has_unrecoverable_payload()`, so the fact
+  recorded in the IR and the rule a fold obeys cannot drift apart. Dimensions
+  are read from the container header (PNG, GIF, BMP, WebP, JPEG) — no decode and
+  no image dependency.
+
+- `Message::media_tokens` and `Message::with_media_tokens` — the host's meter
+  for that media. The kernel cannot see the bytes, so it does not guess: it
+  records what the host charged and sizes the message with it. The number joins
+  the ref's snapshot entry when the ref is assigned, which is what makes the
+  rendered tag, `range.tokens`, the protected tail and the reclaimed statistics
+  agree. A picture-heavy conversation otherwise reads as empty text and never
+  looks like it is filling the window.
+
+- `billion_context_wire::{MediaInfo, MediaSource}`.
+
+### Changed
+
+- A blank text message is no longer dropped when it carries media or is flagged
+  unrecoverable. Dropping it discarded the only handle to the bytes, and the
+  hole the recommender is meant to leave alone.
+
+- `Message::has_unrecoverable_payload()` derives from `media` as well: an
+  unrecoverable `MediaMeta` is a hole even when the explicit flag is `false`.
+
+- `Message`'s fingerprint covers the media facts (never the host's `handle`), so
+  a resent original whose picture changed is a different message.
+
+### Changed (breaking)
+
+- `billion_context::Message` gained two public fields, `media` and
+  `media_tokens`. Struct literals must add them; the constructors set `None` and
+  `0`.
+
+### Fixed
+
+- `--features serde` did not compile on `main`: a `persist` test literal was
+  missing `compress_call_id`.
+
+### Verification
+
+All four feature combinations (`""`, `serde`, `hf-tokenizer`,
+`serde,hf-tokenizer`) pass `cargo test --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` with no warnings.
+
+### Notes
+
+- `billion-context-wire` 0.2.1: the media accessor and its two types are
+  additive; nothing existing changed.
+- `billion-context-tool` 0.6.0 tracks the workspace version and has no changes
+  of its own; its `billion-context` requirement moved to 0.6.0.
+
 ## 0.5.0 — 2026-10-28
 
 ### Added
