@@ -146,3 +146,45 @@ fn a_message_without_media_still_loads() {
     assert!(back.media().is_none());
     assert!(!back.has_unrecoverable_payload());
 }
+
+/// The rendered total is what the model reasons about, so a price the host
+/// already paid must be in it: a zero reads as free and invites a fold that
+/// costs more than the summary saves.
+#[test]
+fn media_tokens_land_in_the_rendered_total() {
+    let render = |msg: Message| {
+        let mut session = Session::new(Config::new(200_000)).with_estimator(CharsAsTokens);
+        let turn = session.process_turn(TurnInput {
+            messages: &[msg],
+            token_count: 10,
+            render: RenderStrategy::All,
+            now: 1,
+        });
+        let text = turn.messages[0].content.text().expect("rendered text");
+        let rest = text.strip_prefix("<acp tokens=\"").expect("tag");
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+
+    let body = Message::text("m1", Role::User, "look");
+    assert_eq!(render(body.clone().with_media(image(true))), "4");
+    assert_eq!(
+        render(body.with_media(image(true)).with_media_tokens(1_200)),
+        "1.2K"
+    );
+}
+
+/// A snapshot written before the price existed loads as zero, which renders
+/// exactly what it rendered then.
+#[cfg(feature = "serde")]
+#[test]
+fn a_message_without_a_media_price_still_loads() {
+    let msg = Message::text("m1", Role::User, "hi").with_media_tokens(900);
+    let mut snapshot = serde_json::to_value(&msg).expect("serialise");
+    let fields = snapshot.as_object_mut().expect("message is an object");
+    assert!(
+        fields.remove("media_tokens").is_some(),
+        "the field exists, so removing it is a real pre-price snapshot"
+    );
+    let back: Message = serde_json::from_value(snapshot).expect("old snapshot");
+    assert_eq!(back.media_tokens, 0);
+}

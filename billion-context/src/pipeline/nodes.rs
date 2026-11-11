@@ -1357,7 +1357,12 @@ impl Node for RenderRefs {
                     t
                 }
             };
-            let tokens = counted + io.messages[i].thinking_tokens;
+            // Both meters are host-supplied and ride the tag only: the core
+            // counts text, and a number it cannot derive must not start
+            // deciding what gets folded.
+            let tokens = counted
+                + io.messages[i].thinking_tokens
+                + io.messages[i].media_tokens;
             let tag = format!(
                 "<acp tokens=\"{}\" type=\"{}\">{}</acp>\n",
                 format_tokens(tokens),

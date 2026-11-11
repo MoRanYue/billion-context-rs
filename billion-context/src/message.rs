@@ -372,6 +372,18 @@ pub struct Message {
     /// Reasoning payload riding along every request but not part of `content`.
     /// Metering only: never rendered, truncated, or folded.
     pub thinking_tokens: u32,
+    /// Tokens the host's own meter charges for this message's media — an image,
+    /// a document — which the kernel cannot meter itself.
+    ///
+    /// Metering only, like [`Message::thinking_tokens`]: the number is added to
+    /// the rendered `tokens` attribute, so the model reads a total that matches
+    /// what the provider will bill instead of a zero it would misread as free.
+    /// It changes no folding, truncation or range arithmetic. The core never
+    /// computes it — meters differ by provider, route and image size — so the
+    /// host supplies the number it already knows, e.g. from the previous turn's
+    /// `usage`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub media_tokens: u32,
     /// Set by the host when this message is the host's own rendered summary of
     /// an active block, so a plain message range must not fold it again.
     pub summary_of_block: Option<crate::ids::BlockId>,
@@ -410,6 +422,7 @@ impl Message {
             role,
             content,
             thinking_tokens: 0,
+            media_tokens: 0,
             summary_of_block: None,
             unrecoverable_payload: false,
             media: None,
@@ -467,6 +480,21 @@ impl Message {
     /// The media this message carries, if any.
     pub fn media(&self) -> Option<&MediaMeta> {
         self.media.as_ref()
+    }
+
+    /// Record what the host's meter charged for this message's media. See
+    /// [`Message::media_tokens`].
+    ///
+    /// ```
+    /// use billion_context::{Message, Role};
+    ///
+    /// let msg = Message::text("u1", Role::User, "look").with_media_tokens(1_200);
+    /// assert_eq!(msg.media_tokens, 1_200);
+    /// ```
+    #[must_use]
+    pub fn with_media_tokens(mut self, tokens: u32) -> Self {
+        self.media_tokens = tokens;
+        self
     }
 
     /// Whether folding this message would destroy bytes the host cannot give
@@ -693,5 +721,17 @@ mod tests {
         let clipped = msg.with_body("short");
         assert_eq!(clipped.content.body(), Some("short"));
         assert!(clipped.media().is_some());
+    }
+
+    /// A price is something the host learned about the bytes, not something the
+    /// bytes are: re-metering the same conversation must not make the kernel see
+    /// a different message and fold around it.
+    #[test]
+    fn media_tokens_are_metering_not_identity() {
+        let plain = Message::text("a", Role::User, "look");
+        let priced = plain.clone().with_media_tokens(1_200);
+        assert_eq!(priced.media_tokens, 1_200);
+        assert_eq!(plain.fingerprint(), priced.fingerprint());
+        assert_eq!(Message::text("a", Role::User, "look").media_tokens, 0);
     }
 }
