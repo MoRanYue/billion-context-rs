@@ -104,7 +104,14 @@ impl Node for AssignRefs {
                         .content
                         .foldable_text()
                         .or_else(|| msg.content.tool_arguments());
-                    let tokens = sized.map(|t| ctx.estimator.count(t)).unwrap_or(0);
+                    // The host's media meter joins the text count here, so every
+                    // number downstream — the rendered tag, a range's reclaimable
+                    // size, the protected tail — is one measurement of what the
+                    // message costs, not a text-only shadow of it.
+                    let tokens = sized
+                        .map(|t| ctx.estimator.count(t))
+                        .unwrap_or(0)
+                        .saturating_add(msg.media_tokens);
                     // Written once, read forever: re-estimating would churn the
                     // rendered tag bytes and bust the provider prefix cache.
                     io.state.token_snapshot.entry(r).or_insert(tokens);
@@ -1357,12 +1364,11 @@ impl Node for RenderRefs {
                     t
                 }
             };
-            // Both meters are host-supplied and ride the tag only: the core
-            // counts text, and a number it cannot derive must not start
-            // deciding what gets folded.
-            let tokens = counted
-                + io.messages[i].thinking_tokens
-                + io.messages[i].media_tokens;
+            // `counted` already carries the host's media meter — it is folded
+            // into the snapshot at ref assignment. `thinking_tokens` is added
+            // here: reasoning rides every request but has never been part of
+            // the fold arithmetic.
+            let tokens = counted + io.messages[i].thinking_tokens;
             let tag = format!(
                 "<acp tokens=\"{}\" type=\"{}\">{}</acp>\n",
                 format_tokens(tokens),

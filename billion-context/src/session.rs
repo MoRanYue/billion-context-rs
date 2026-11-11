@@ -1164,6 +1164,54 @@ mod tests {
         );
     }
 
+    /// The host's media meter reaches the numbers the kernel reasons with, not
+    /// only the rendered tag: a message whose picture costs thousands must be
+    /// sized at thousands, or the fold arithmetic underrates it everywhere.
+    #[test]
+    fn the_snapshot_sizes_a_message_by_text_and_media() {
+        let mut s = session();
+        let mut msgs = conversation(2, 10);
+        msgs[1] = msgs[1].clone().with_media_tokens(4_000);
+        let _ = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 100,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+        let sized = s.state.token_snapshot[&MsgRef::new(2).unwrap()];
+        assert!(
+            sized >= 4_000,
+            "message sized at {sized} tokens, less than its media alone"
+        );
+    }
+
+    /// A range that would take a screenshot away reclaims what the screenshot
+    /// costs. Reporting only the caption would make the one fold that matters
+    /// look like the least valuable.
+    #[test]
+    fn a_range_holding_media_reports_its_real_size() {
+        let mut s = session();
+        let mut msgs = conversation(8, 2_000);
+        msgs[1] = msgs[1].clone().with_media_tokens(9_000);
+        let turn = s.process_turn(TurnInput {
+            messages: &msgs,
+            token_count: 100,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+        let r = MsgRef::new(2).expect("ref");
+        let range = turn
+            .ranges
+            .iter()
+            .find(|range| range.start <= r && r <= range.end)
+            .expect("the metered message sits in a foldable range");
+        assert!(
+            range.tokens >= 9_000,
+            "range reported {} tokens, less than the media it would reclaim",
+            range.tokens
+        );
+    }
+
     /// The same hole, expressed the way a host holding wire facts expresses it:
     /// no hand-set flag, just the media's own verdict.
     #[test]

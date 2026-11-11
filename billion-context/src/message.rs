@@ -375,13 +375,17 @@ pub struct Message {
     /// Tokens the host's own meter charges for this message's media — an image,
     /// a document — which the kernel cannot meter itself.
     ///
-    /// Metering only, like [`Message::thinking_tokens`]: the number is added to
-    /// the rendered `tokens` attribute, so the model reads a total that matches
-    /// what the provider will bill instead of a zero it would misread as free.
-    /// It changes no folding, truncation or range arithmetic. The core never
-    /// computes it — meters differ by provider, route and image size — so the
-    /// host supplies the number it already knows, e.g. from the previous turn's
-    /// `usage`.
+    /// The number joins the kernel's own size for the message, so a range that
+    /// holds a screenshot reports what folding it would really reclaim, and the
+    /// protected tail is measured in the same units. Without it a picture-heavy
+    /// conversation looks nearly empty to the fold arithmetic, and deciding
+    /// whether the images fill the window is left to the host alone.
+    ///
+    /// Attach it when the message first enters the conversation. The size is
+    /// written once — a later change would rewrite tag bytes already sitting in
+    /// the provider's prefix cache — so a host that refines its meter afterwards
+    /// only affects messages it has not sent yet. The core never computes the
+    /// number: meters differ by provider, route and image size.
     #[cfg_attr(feature = "serde", serde(default))]
     pub media_tokens: u32,
     /// Set by the host when this message is the host's own rendered summary of
