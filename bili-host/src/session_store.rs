@@ -1301,7 +1301,7 @@ mod tests {
         // contributes its summary cost, never a negative count of requests.
         entry.requests = 8;
         let econ = session_economics(&entry);
-        assert_eq!(econ.gross, 80 * 5 + 50 * 0);
+        assert_eq!(econ.gross, 400);
         assert_eq!(econ.net, 400 - 30);
     }
 
@@ -1321,7 +1321,7 @@ mod tests {
         let converted = crate::anthropic::to_core(&body);
         let store = Store::new();
         let first = store.prepare("ledger-live", 200_000, &converted.messages, 12_000, None);
-        assert!(first.ranges.len() > 0 || first.messages.len() == converted.messages.len());
+        assert!(!first.ranges.is_empty() || first.messages.len() == converted.messages.len());
         let summary = "This summary keeps the deployment decision, the rejected alternative, and the files touched.";
         let (_, outcome, blocks) = store.tool(
             "ledger-live",

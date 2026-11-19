@@ -7,6 +7,10 @@
 //! panel, and writes the `proxy-origin` / `instances/<id>.json` markers in the
 //! Node layout so a native launcher can discover a live instance.
 
+// Some helpers mirror the Node host surface but are not wired into every
+// endpoint yet; keep them available for parity work without failing `-D warnings`.
+#![allow(dead_code)]
+
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
@@ -25,7 +29,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::json;
 
@@ -658,7 +661,7 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
         state
             .sessions
             .set_meta(&key, "openai", &upstream_base(target));
-        let mut rebuilt = openai::from_core(&prepared.messages, &converted.sidecar);
+        let rebuilt = openai::from_core(&prepared.messages, &converted.sidecar);
         body["messages"] = Value::Array(rebuilt);
         openai::inject_standing_instructions(&mut body);
         if let Some(note) = prepared.nudge.as_deref() {

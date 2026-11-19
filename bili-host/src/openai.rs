@@ -226,8 +226,10 @@ pub fn to_core(body: &Value) -> Converted {
         .unwrap_or_default();
     let tool_names = collect_tool_names(&messages);
     let mut cluster = ClusterCounter::default();
-    let mut sidecar = Sidecar::default();
-    sidecar.tool_names = tool_names.clone();
+    let mut sidecar = Sidecar {
+        tool_names: tool_names.clone(),
+        ..Sidecar::default()
+    };
     let mut out: Vec<KMessage> = Vec::new();
 
     for (index, message) in messages.iter().enumerate() {
@@ -314,7 +316,7 @@ pub fn to_core(body: &Value) -> Converted {
                 if !reasoning.is_empty() {
                     let id = derive_id(role, "reasoning", "", reasoning, None);
                     push_core(
-                        KMessage::reasoning(id, Role::Assistant, reasoning.to_string()),
+                        KMessage::reasoning(id, Role::Assistant, reasoning),
                         &mut cluster,
                         &mut out,
                         &mut sidecar,
