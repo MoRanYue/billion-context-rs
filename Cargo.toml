@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["billion-context", "billion-context-wire", "billion-context-tool"]
+members = ["billion-context", "billion-context-wire", "billion-context-tool", "bili-host"]
 
 [workspace.package]
 version = "0.6.0"
