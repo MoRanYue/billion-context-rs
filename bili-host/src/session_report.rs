@@ -54,7 +54,10 @@ fn markdown_report(status: &Value, session_id: &str) -> Response {
         .get("contextLimit")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let pct = if limit > 0 { context * 100 / limit } else { 0 };
+    let pct = context
+        .checked_mul(100)
+        .and_then(|value| value.checked_div(limit))
+        .unwrap_or(0);
     let mut lines = vec![
         "# billion-context session report".to_string(),
         String::new(),
@@ -159,7 +162,7 @@ fn svg_report(status: &Value, session_id: &str, lang: &str) -> Response {
         .get("contextLimit")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let rows = vec![
+    let rows = [
         format!("session: {session_id}"),
         format!("lang: {lang}"),
         format!("context: {context} / {limit}"),
