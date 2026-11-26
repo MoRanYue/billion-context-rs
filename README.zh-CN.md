@@ -8,13 +8,13 @@
 
 [`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context) 的核心机制（引用分配、折叠、3 层 LSM、nudge 节奏、跨回合去重）用 Rust 重写，供任意 Rust 程序嵌入使用。
 
-原项目是 TypeScript 的 ACP 代理，内核（`kernel/`，npm 包 `acp-kernel`）是框架无关的压缩引擎。这里移植内核，不移植代理和 Web 控制台；`bili-host` 是可选的 Rust 宿主，把内核接成转发、插件和管理面。
+原项目是 TypeScript 的 ACP 代理，内核（`kernel/`，npm 包 `acp-kernel`）是框架无关的压缩引擎。这里移植内核，不移植代理和 Web 控制台；`billion-context-proxy` 是可选的 Rust 宿主，把内核接成转发、插件和管理面。
 
 ```
 billion-context/               纯引擎：消息 → 引用 → 折叠 → 恢复，零 IO、零异步、零 unsafe
 billion-context-wire/          协议层：Anthropic / OpenAI 的 wire types，与 IR 无损互转
 billion-context-tool/          工具层：把折叠/恢复包装成模型可直接调用的 tool
-bili-host/                     可选 axum 宿主：/bili 转发、插件 API、管理端点
+billion-context-proxy/         可选 axum 宿主：/bili 转发、插件 API、管理端点
 ```
 
 默认构建**零依赖**（`serde` 与真分词器都是可选 feature），无 `unsafe`（`#![forbid(unsafe_code)]`），全部同步。

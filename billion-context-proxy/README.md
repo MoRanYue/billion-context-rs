@@ -1,4 +1,4 @@
-# bili-host (Rust)
+# billion-context-proxy (Rust)
 
 billion-context 宿主/代理的 Rust 实现。把 OpenAI Chat Completions 与 Anthropic
 Messages 请求接入 workspace 中的 `billion-context` 内核，按折后投影上行，并在本地
@@ -7,9 +7,9 @@ Messages 请求接入 workspace 中的 `billion-context` 内核，按折后投�
 ## 构建与运行
 
 ```powershell
-cargo build -p bili-host --release
-cargo test -p bili-host
-target\release\bili-host.exe start --port 18113 --debug
+cargo build -p billion-context-proxy --release
+cargo test -p billion-context-proxy
+target\release\billion-context-proxy.exe start --port 18113 --debug
 ```
 
 默认 `127.0.0.1:8765`；`--passthrough` 关闭压缩，`--strict-port` 端口占用时退出。
@@ -36,7 +36,7 @@ target\release\bili-host.exe start --port 18113 --debug
 
 ```powershell
 $env:BILLION_CONTEXT_PROXY = "http://127.0.0.1:18187"
-.\bili-host.exe start --port 18187
+.\billion-context-proxy.exe start --port 18187
 ```
 
 或让插件的 spawn 路径直接使用 Rust（插件把 `BILLION_CONTEXT_NODE` 当作 node
@@ -44,7 +44,7 @@ $env:BILLION_CONTEXT_PROXY = "http://127.0.0.1:18187"
 前面的脚本参数）：
 
 ```powershell
-$env:BILLION_CONTEXT_NODE = "<path-to-bili-host.exe>"
+$env:BILLION_CONTEXT_NODE = "<path-to-billion-context-proxy.exe>"
 ```
 
 ## 端点

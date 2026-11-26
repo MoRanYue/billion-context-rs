@@ -1,4 +1,4 @@
-//! bili-host — Rust replacement for the billion-context Node proxy host.
+//! billion-context-proxy — Rust replacement for the billion-context Node proxy host.
 //!
 //! Accepts model traffic rewritten to `/bili/<absolute-url>`, converts OpenAI
 //! Chat Completions / Anthropic Messages into the billion-context kernel,
@@ -205,7 +205,7 @@ fn opts_from_args() -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "bili-host {} — usage: bili-host [start] [--host H] [--port N] [--passthrough] [--debug]",
+            "billion-context-proxy {} — usage: billion-context-proxy [start] [--host H] [--port N] [--passthrough] [--debug]",
             VERSION
         );
         std::process::exit(0);
@@ -241,7 +241,7 @@ fn opts_from_args() -> Options {
             other => {
                 // Unknown flags belong to the Node CLI surface we do not emulate
                 // yet; ignore rather than fail so a hand-rolled spawn still boots.
-                eprintln!("[bili-host] ignoring unrecognized argument: {other}");
+                eprintln!("[billion-context-proxy] ignoring unrecognized argument: {other}");
             }
         }
         i += 1;
@@ -482,7 +482,12 @@ async fn forward_handler(
         *upstream = Some(upstream_base(&target));
     }
     if state.debug {
-        eprintln!("[bili-host] {} {} -> {}", method.as_str(), raw, target);
+        eprintln!(
+            "[billion-context-proxy] {} {} -> {}",
+            method.as_str(),
+            raw,
+            target
+        );
     }
 
     let mut forward = HeaderMap::new();
@@ -546,7 +551,7 @@ async fn forward_handler(
     let upstream = match request.send().await {
         Ok(resp) => resp,
         Err(err) => {
-            eprintln!("[bili-host] upstream error for {target}: {err}");
+            eprintln!("[billion-context-proxy] upstream error for {target}: {err}");
             record_upstream_failure(&state, &target, "TRANSPORT");
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -672,7 +677,7 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
         }
         if state.debug {
             eprintln!(
-                "[bili-host] prepared openai {key}: {} messages, tokens {}",
+                "[billion-context-proxy] prepared openai {key}: {} messages, tokens {}",
                 body["messages"].as_array().map(Vec::len).unwrap_or(0),
                 token_count
             );
@@ -706,7 +711,7 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
     }
     if state.debug {
         eprintln!(
-            "[bili-host] prepared {key}: {} -> {} messages, tokens {}",
+            "[billion-context-proxy] prepared {key}: {} -> {} messages, tokens {}",
             body["messages"].as_array().map(Vec::len).unwrap_or(0),
             rebuilt_len(&body),
             token_count
@@ -1377,7 +1382,7 @@ async fn main() {
         match bind_with_ladder(&opts.host, opts.port, opts.strict_port).await {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("[bili-host] {err}");
+                eprintln!("[billion-context-proxy] {err}");
                 std::process::exit(3);
             }
         };
@@ -1408,7 +1413,7 @@ async fn main() {
     {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("[bili-host] failed to build HTTP client: {err}");
+            eprintln!("[billion-context-proxy] failed to build HTTP client: {err}");
             std::process::exit(1);
         }
     };
@@ -1463,13 +1468,13 @@ async fn main() {
         sessions_dir: Some(sessions_dir.to_string_lossy().to_string()),
     };
     if let Err(err) = atomic_write_json(&state_dir().join("proxy-origin"), &instance) {
-        eprintln!("[bili-host] warning: cannot write proxy-origin: {err}");
+        eprintln!("[billion-context-proxy] warning: cannot write proxy-origin: {err}");
     }
     let registry_path = state_dir()
         .join("instances")
         .join(format!("{instance_id}.json"));
     if let Err(err) = atomic_write_json(&registry_path, &registry) {
-        eprintln!("[bili-host] warning: cannot write registry marker: {err}");
+        eprintln!("[billion-context-proxy] warning: cannot write registry marker: {err}");
     }
 
     // Parent watchdog (#964): die with the host that spawned us instead of
@@ -1481,7 +1486,7 @@ async fn main() {
             loop {
                 tick.tick().await;
                 if !pid_alive(parent) {
-                    eprintln!("[bili-host] parent pid {parent} is gone; shutting down");
+                    eprintln!("[billion-context-proxy] parent pid {parent} is gone; shutting down");
                     let _ = tx.send(true);
                     break;
                 }
@@ -1519,7 +1524,7 @@ async fn main() {
         .with_state(state.clone());
 
     eprintln!(
-        "[bili-host] listening on {origin} (passthrough={})",
+        "[billion-context-proxy] listening on {origin} (passthrough={})",
         opts.passthrough
     );
     let shutdown_signal = async move {
@@ -1532,7 +1537,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal)
         .await
     {
-        eprintln!("[bili-host] serve error: {err}");
+        eprintln!("[billion-context-proxy] serve error: {err}");
     }
 
     // Cleanup markers only when they still point at us.
@@ -1545,5 +1550,5 @@ async fn main() {
         }
     }
     let _ = std::fs::remove_file(&registry_path);
-    eprintln!("[bili-host] exited");
+    eprintln!("[billion-context-proxy] exited");
 }
