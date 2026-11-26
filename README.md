@@ -8,13 +8,13 @@
 
 A Rust rewrite of the core mechanism in [`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context) — ref assignment, folding, the 3-tier LSM, nudge cadence, cross-turn reconciliation — for embedding in any Rust program.
 
-The original is a TypeScript ACP proxy. Its kernel (`kernel/`, npm package `acp-kernel`) is a framework-agnostic compression engine, and that is what was ported. The proxy and the web console were not; `bili-host` is an optional Rust host that wires the kernel into a forwarding, plugin and admin surface.
+The original is a TypeScript ACP proxy. Its kernel (`kernel/`, npm package `acp-kernel`) is a framework-agnostic compression engine, and that is what was ported. The proxy and the web console were not; `billion-context-proxy` is an optional Rust host that wires the kernel into a forwarding, plugin and admin surface.
 
 ```
 billion-context/        pure engine: message → ref → fold → recover. No IO, no async, no unsafe
 billion-context-wire/   protocol layer: Anthropic / OpenAI wire types, lossless to the IR
 billion-context-tool/   tool layer: folding, retrieval, search and status as tools a model can call
-bili-host/              optional axum host: /bili forwarding, plugin API, admin routes
+billion-context-proxy/  optional axum host: /bili forwarding, plugin API, admin routes
 ```
 
 The default build has **zero dependencies** (`serde` and the real tokenizer are opt-in features), contains no `unsafe` (`#![forbid(unsafe_code)]`), and is fully synchronous.

@@ -130,14 +130,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
-name = "bili-host"
+name = "billion-context"
+version = "0.6.0"
+dependencies = [
+ "deepseek-recipe-encoding",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "billion-context-proxy"
 version = "0.1.216"
 dependencies = [
  "async-stream",
  "axum",
  "billion-context",
  "billion-context-tool",
- "billion-context-wire",
  "bytes",
  "futures-util",
  "hex",
@@ -149,16 +158,6 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "billion-context"
-version = "0.6.0"
-dependencies = [
- "deepseek-recipe-encoding",
- "serde",
- "serde_json",
- "tokenizers",
 ]
 
 [[package]]
