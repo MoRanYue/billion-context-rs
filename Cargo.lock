@@ -141,12 +141,13 @@ dependencies = [
 
 [[package]]
 name = "billion-context-proxy"
-version = "0.1.216"
+version = "0.1.217"
 dependencies = [
  "async-stream",
  "axum",
  "billion-context",
  "billion-context-tool",
+ "billion-context-wire",
  "bytes",
  "futures-util",
  "hex",

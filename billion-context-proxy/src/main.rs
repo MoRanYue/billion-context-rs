@@ -7,9 +7,7 @@
 //! panel, and writes the `proxy-origin` / `instances/<id>.json` markers in the
 //! Node layout so a native launcher can discover a live instance.
 
-// Some helpers mirror the Node host surface but are not wired into every
-// endpoint yet; keep them available for parity work without failing `-D warnings`.
-#![allow(dead_code)]
+#![recursion_limit = "256"]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,18 +31,33 @@ use serde::Serialize;
 use serde_json::json;
 
 mod anthropic;
+mod artifact;
+mod build_id;
+mod d1b_runner;
+mod dsh_compaction;
 mod openai;
+mod pricing;
+mod prune;
+#[cfg(test)]
+mod replay;
 mod session_report;
 mod session_store;
+mod summarizer;
+mod summary_carry;
+#[cfg(test)]
+mod test_env;
+mod tool_runner;
 mod usage;
+mod usage_ledger;
 
 use tokio::{net::TcpListener, sync::watch, time};
 use uuid::Uuid;
 
 use serde_json::Value;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HEALTH_PATH: &str = "/__bili/health";
+/// The package version. Kept as a local alias so the many `json!` literals below
+/// stay terse; the single source of truth is `build_id::VERSION`.
+const VERSION: &str = build_id::VERSION;
 
 const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -174,14 +187,26 @@ struct AppState {
     upstream: Mutex<Option<String>>,
     upstream_failures: Mutex<HashMap<String, UpstreamFailure>>,
     sessions: session_store::Store,
-    /// Per-instance token written by the launcher.  Admin mutations require it
+    /// Host-owned answer to "is this upstream a mock?".  `None` means the host
+    /// derives it from the actual upstream endpoint.  A request header never
+    /// changes this (D-2 requirement).
+    usage_source: Option<usage_ledger::UsageSource>,
+    /// P1 auto fallback: fold on the host's own initiative when the model
+    /// ignores the nudge (or the window is nearly full). Opt-in because it
+    /// bills a summarizer-chain call per attempt.
+    auto_fallback: bool,
+    /// Phase 3.1 speculative folds: pre-distill old T1 blocks while the window
+    /// sits in the 45–75% band. Opt-in for the same reason: it bills a chain
+    /// call, and its candidate can be discarded when the blocks move.
+    speculation: bool,
+    /// Per-instance token written by the launcher. Admin mutations require it
     /// when present; absent means standalone development mode (still guarded by
     /// the loopback Host and Origin checks).
     launch_token: Option<String>,
-    /// Exact non-loopback panel origins allowed to call `/__bili/*`.  Loopback
+    /// Exact non-loopback panel origins allowed to call `/__bili/*`. Loopback
     /// origins are always accepted so the DSH web view keeps working.
     admin_origins: Vec<String>,
-    /// Hosts the forward proxy may dial.  Entries support exact names and
+    /// Hosts the forward proxy may dial. Entries support exact names and
     /// `*.suffix` wildcards; literal IPs are refused unless explicitly allowed.
     upstream_allowlist: Vec<String>,
     allow_private_upstreams: bool,
@@ -203,6 +228,11 @@ struct Options {
     debug: bool,
     strict_port: bool,
     allow_remote_bind: bool,
+    cleanup_artifacts: bool,
+    usage_source: Option<usage_ledger::UsageSource>,
+    /// Present only for the explicit `d1b-run` subcommand; the normal proxy
+    /// path never constructs a runner.
+    d1b: Option<d1b_runner::RunOptions>,
 }
 
 fn env_u16(name: &str) -> Option<u16> {
@@ -217,13 +247,13 @@ fn opts_from_args() -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "billion-context-proxy {} — usage: billion-context-proxy [start] [--host H] [--port N] [--passthrough] [--debug] [--allow-remote-bind]",
-            VERSION
+            "billion-context-proxy {} — usage: billion-context-proxy [start] [--host H] [--port N] [--passthrough] [--debug] [--cleanup-artifacts] [--usage-source provider|mock]\n  d1b-run --d1b-upstream URL --d1b-model M [--d1b-provider NAME] [--d1b-prompt TEXT] [--d1b-max-calls N] [--d1b-max-input-tokens N] [--d1b-max-output-tokens N] [--d1b-timeout-ms N] [--d1b-cost-cap N] [--d1b-cost-currency CODE] [--d1b-require-cost-cap]\n  (--d1b-cost-cap implies a strict price check: without a usable price the run is refused)",
+            build_id::BuildInfo::current().summary()
         );
         std::process::exit(0);
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("{VERSION}");
+        print!("{}", build_id::BuildInfo::current().cli_text());
         std::process::exit(0);
     }
     let mut host = env_str("BILI_HOST").unwrap_or_else(|| "127.0.0.1".into());
@@ -232,10 +262,15 @@ fn opts_from_args() -> Options {
     let mut debug = env_str("BILI_DEBUG").as_deref() == Some("1");
     let mut strict_port = env_str("BILI_STRICT_PORT").as_deref() == Some("1");
     let mut allow_remote_bind = env_str("BILI_ALLOW_REMOTE_BIND").as_deref() == Some("1");
+    let mut cleanup_artifacts = false;
+    // Host-owned usage provenance: set once at startup, never per request.
+    let mut usage_source =
+        env_str("BILI_USAGE_SOURCE").and_then(|raw| usage_ledger::UsageSource::parse(&raw));
     let mut i = 0;
+    let d1b_mode = args.iter().any(|arg| arg == "d1b-run");
     while i < args.len() {
         match args[i].as_str() {
-            "start" => {}
+            "start" | "d1b-run" => {}
             "--host" => {
                 if let Some(v) = args.get(i + 1) {
                     host = v.clone();
@@ -252,14 +287,42 @@ fn opts_from_args() -> Options {
             "--debug" => debug = true,
             "--strict-port" => strict_port = true,
             "--allow-remote-bind" => allow_remote_bind = true,
+            "--cleanup-artifacts" => cleanup_artifacts = true,
+            "--usage-source" => {
+                if let Some(v) = args.get(i + 1) {
+                    usage_source = usage_ledger::UsageSource::parse(v);
+                    if usage_source.is_none() {
+                        eprintln!(
+                            "[billion-context-proxy] ignoring invalid --usage-source value: {v}"
+                        );
+                    }
+                    i += 1;
+                }
+            }
+            other if d1b_mode && other.starts_with("--d1b-") => {
+                i += 1;
+            }
             other => {
                 // Unknown flags belong to the Node CLI surface we do not emulate
                 // yet; ignore rather than fail so a hand-rolled spawn still boots.
-                eprintln!("[billion-context-proxy] ignoring unrecognized argument: {other}");
+                if !d1b_mode {
+                    eprintln!("[billion-context-proxy] ignoring unrecognized argument: {other}");
+                }
             }
         }
         i += 1;
     }
+    let d1b = if args.iter().any(|arg| arg == "d1b-run") {
+        match d1b_runner::parse_args(&args) {
+            Ok(options) => Some(options),
+            Err(err) => {
+                eprintln!("[billion-context-proxy] d1b-run: {err}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     Options {
         host,
         port,
@@ -267,6 +330,9 @@ fn opts_from_args() -> Options {
         debug,
         strict_port,
         allow_remote_bind,
+        cleanup_artifacts,
+        usage_source,
+        d1b,
     }
 }
 
@@ -295,6 +361,16 @@ fn config_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"));
     base.join("billion-context").join("billion-context.json")
+}
+
+/// Resolve the D1b credential binding from the fixed allowlist and verify the
+/// configured provider entry matches it exactly. No credential file is
+/// consulted and no arbitrary `apiKeyEnv` name is accepted.
+fn d1b_provider_credential_env(provider: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let document: Value = serde_json::from_str(&text).ok()?;
+    let recipe = summarizer::provider_recipe(&document, provider)?;
+    d1b_runner::provider_binding_from_recipe(provider, &recipe).map(str::to_string)
 }
 
 fn atomic_write_text(path: &Path, text: &str) -> io::Result<()> {
@@ -465,9 +541,10 @@ fn upstream_allowlist_from_env(mitm_domains: &[String]) -> Vec<String> {
     hosts
 }
 
-/// Only http(s) targets whose host is explicitly listed may be dialed.  A
-/// literal IP is accepted only when the operator opted in (`BILI_ALLOW_PRIVATE_UPSTREAM=1`)
-/// or wrote that exact IP into the allowlist (local mock upstreams).
+/// Only http(s) targets whose host is explicitly listed may be dialed. A
+/// literal IP is accepted only when the operator opted in
+/// (`BILI_ALLOW_PRIVATE_UPSTREAM=1`) or wrote that exact IP into the allowlist
+/// (local mock upstreams).
 fn upstream_target_allowed(target: &str, allowlist: &[String], allow_ip: bool) -> bool {
     let Ok(url) = reqwest::Url::parse(target) else {
         return false;
@@ -550,7 +627,7 @@ fn admin_origins_from_env(origin: &str, port: u16) -> Vec<String> {
 }
 
 /// A browser may read `/__bili/*` only from a loopback origin or an explicitly
-/// configured panel origin.  `Origin: null` and public web origins are denied.
+/// configured panel origin. `Origin: null` and public web origins are denied.
 fn admin_origin_allowed(origin: &str, state: &AppState) -> bool {
     state.admin_origins.iter().any(|allowed| allowed == origin)
         || origin_host(origin).is_some_and(|host| host_is_loopback(&host))
@@ -677,18 +754,21 @@ async fn forward_handler(
     ) {
         return error_response(
             StatusCode::FORBIDDEN,
-            "upstream target is not in the configured allowlist",
+            "upstream host is not allowlisted; set BILI_UPSTREAM_ALLOWLIST",
         );
     }
     if let Ok(mut upstream) = state.upstream.lock() {
         *upstream = Some(upstream_base(&target));
     }
+    // Start of this upstream attempt, including prepare/prune.  The ledger uses
+    // this window to prove which artifacts this request itself wrote.
+    let request_started_at = now_ms();
     if state.debug {
         eprintln!(
             "[billion-context-proxy] {} {} -> {}",
             method.as_str(),
             raw,
-            target
+            pricing::redacted_origin(&target)
         );
     }
 
@@ -708,6 +788,8 @@ async fn forward_handler(
     request = request.headers(forward);
 
     let mut usage_meta: Option<(String, Option<String>)> = None;
+    let mut prepare_trace: Option<PrepareTrace> = None;
+    let mut sent_digest: Option<(String, u64)> = None;
 
     // Buffer the request body so the upstream sees an exact Content-Length
     // instead of a streamed chunked body (the Node host relays with a known
@@ -724,10 +806,29 @@ async fn forward_handler(
                 );
             }
         };
+        // A DSH native compaction call is the host's summarizer asking for a
+        // summary, not the user talking. Answering it from the bili snapshot
+        // here keeps it off every model route — a real route answers the
+        // instruction with no text block and the host aborts compaction
+        // (`summarization produced no text summary content`).
+        if !state.passthrough
+            && let Some(answer) = dsh_compaction_answer(&state, &target, &headers, &payload).await
+        {
+            return answer;
+        }
         let payload = if state.passthrough {
             payload
         } else {
-            let prepared = maybe_prepare(&state, &target, &headers, payload);
+            // P1: a host-initiated fold must land before the projection is
+            // built, otherwise the turn that runs out of room never sees it.
+            if state.auto_fallback
+                && target_has_model_wire(&target)
+                && let Some(note) = maybe_auto_fallback(&state, &headers, &payload).await
+            {
+                eprintln!("[billion-context-proxy] {note}");
+            }
+            let (prepared, trace) = maybe_prepare(&state, &target, &headers, payload);
+            prepare_trace = trace;
             if target_has_model_wire(&target) {
                 if let Ok(body) = serde_json::from_slice::<Value>(&prepared) {
                     let model = body
@@ -745,19 +846,84 @@ async fn forward_handler(
             }
             prepared
         };
+        if state.speculation && target_has_model_wire(&target) {
+            maybe_background_speculation(state.clone(), headers.clone(), payload.clone()).await;
+        }
+        sent_digest = Some((usage_ledger::sha256_hex(&payload), payload.len() as u64));
         request = request
             .header(reqwest::header::CONTENT_LENGTH, payload.len())
             .body(payload);
     }
 
+    // One ledger record per upstream model attempt, written before the send so
+    // a transport failure still has a row.  A start without a finish means the
+    // outcome is unknown and must never be counted as success.
+    let mut ledger_record: Option<usage_ledger::RequestRecord> = None;
+    if let (Some((key, model)), Some((hash, bytes))) = (usage_meta.as_ref(), sent_digest.as_ref()) {
+        if let Some(requests_dir) = state.sessions.requests_dir() {
+            let protocol = prepare_trace
+                .as_ref()
+                .map(|trace| trace.protocol)
+                .unwrap_or(if target.contains("/chat/completions") {
+                    "openai"
+                } else {
+                    "anthropic"
+                });
+            let upstream = upstream_base(&target);
+            let (source, basis) = usage_ledger::usage_source(state.usage_source, &upstream);
+            let prune = prepare_trace.as_ref().and_then(|trace| {
+                trace.prune.as_ref().map(|report| {
+                    let (refs, attribution) = state.sessions.resolve_prune_artifacts(
+                        report,
+                        request_started_at,
+                        now_ms(),
+                    );
+                    usage_ledger::PruneAttribution::new(report, refs, attribution)
+                })
+            });
+            let record = usage_ledger::RequestRecord::new(
+                usage_ledger::ledger_path(&requests_dir, key),
+                key,
+                protocol,
+                model.clone(),
+                &upstream,
+                source,
+                basis,
+                request_started_at,
+                hash.clone(),
+                *bytes,
+                prepare_trace.is_some(),
+                prune,
+                &headers,
+            );
+            if let Err(err) = record.start() {
+                eprintln!("[billion-context-proxy] usage ledger start write failed: {err}");
+            }
+            ledger_record = Some(record);
+        }
+    }
+
     let upstream = match request.send().await {
         Ok(resp) => resp,
         Err(err) => {
-            eprintln!("[billion-context-proxy] upstream error for {target}: {err}");
+            // The reqwest message embeds the full URL; only the class and the
+            // redacted origin are safe to record.
+            eprintln!(
+                "[billion-context-proxy] upstream error for {}: {}",
+                pricing::redacted_origin(&target),
+                usage_ledger::error_class(&err)
+            );
             record_upstream_failure(&state, &target, "TRANSPORT");
+            if let Some(record) = ledger_record.as_ref() {
+                if let Err(write_err) = record.finish(usage_ledger::Finish::transport(&err)) {
+                    eprintln!(
+                        "[billion-context-proxy] usage ledger finish write failed: {write_err}"
+                    );
+                }
+            }
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("upstream relay failed: {err}"),
+                &format!("upstream relay failed: {}", usage_ledger::error_class(&err)),
             );
         }
     };
@@ -772,6 +938,22 @@ async fn forward_handler(
     } else if status.is_success() {
         clear_upstream_failure(&state, &target);
     }
+    if !status.is_success() {
+        // Not a model answer: the body is forwarded untouched (and therefore
+        // not hashed), so the ledger states exactly that.
+        if let Some(record) = ledger_record.as_ref() {
+            if let Err(write_err) = record.finish(usage_ledger::Finish::http_error(status.as_u16()))
+            {
+                eprintln!("[billion-context-proxy] usage ledger finish write failed: {write_err}");
+            }
+        }
+    }
+    // The tee replaces the upstream body with a stream, so a forwarded
+    // Content-Length would let the client-side framing declare the response
+    // complete before the tee's final bookkeeping ran.  Dropping the length
+    // makes hyper frame the identical bytes as chunked and poll the stream to
+    // its end, which is what records usage and the finish line.
+    let tee = usage_meta.is_some();
     let mut response = Response::builder().status(status);
     if let Some(builder) = response.headers_mut() {
         for (name, value) in upstream.headers().iter() {
@@ -784,6 +966,9 @@ async fn forward_handler(
                     | "upgrade"
                     | "proxy-authenticate"
             ) {
+                continue;
+            }
+            if tee && n == "content-length" {
                 continue;
             }
             // Node's passthrough resolves relative redirects against the
@@ -816,6 +1001,7 @@ async fn forward_handler(
             state.sessions.clone(),
             key,
             model,
+            ledger_record.take(),
         ))
     } else {
         Body::from_stream(upstream.bytes_stream())
@@ -829,24 +1015,181 @@ async fn forward_handler(
     }
 }
 
+/// Answers a DSH native compaction call from the bili snapshot instead of
+/// forwarding it (Node: `dsh compaction call identified (…) — ANSWERED LOCALLY
+/// with the bili snapshot (#3733 authored checkpoint)`).
+///
+/// `None` means "not a compaction call": the request proceeds to prepare and
+/// the upstream exactly as before. When the call is recognized but bili holds
+/// no active block, there is nothing to answer with; forwarding would let the
+/// host's checkpoint durably shadow the raw history, so the call is refused
+/// unless `dsh.authoredCompactionRefuse` is turned off for inspection.
+async fn dsh_compaction_answer(
+    state: &Arc<AppState>,
+    target: &str,
+    headers: &HeaderMap,
+    payload: &Bytes,
+) -> Option<Response> {
+    let protocol = dsh_compaction::protocol_of(target)?;
+    let parsed = serde_json::from_slice::<Value>(payload).ok();
+    let declared = dsh_compaction::declared_compaction_call(headers);
+    let marked = parsed
+        .as_ref()
+        .is_some_and(dsh_compaction::marked_compaction_call)
+        || dsh_compaction::body_looks_like_compaction(payload);
+    if !declared && !marked {
+        return None;
+    }
+
+    let config = config_path();
+    let key = parsed
+        .as_ref()
+        .map(|body| conversation_key(headers, body))
+        .unwrap_or_else(|| conversation_key(headers, &Value::Null));
+    let stream = parsed
+        .as_ref()
+        .and_then(|body| body.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let messages = parsed
+        .as_ref()
+        .and_then(|body| body.get("messages"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let identified = if declared {
+        "declared purpose=compaction (#6880)"
+    } else {
+        "final user message = COMPACTION_INSTRUCTION"
+    };
+
+    let checkpoint = dsh_compaction::authored_compaction_enabled(&config)
+        .then(|| state.sessions.authored_checkpoint(&key))
+        .flatten();
+    let mut checkpoint = checkpoint;
+
+    // Fold before refusing. An empty block set is only *unanswerable*, not
+    // unfixable: the session usually still holds foldable ranges, and the
+    // caller cannot spend a compress call on them (bili's own breaker forbids
+    // it once armed). Refusing here is that deadlock (#7762). So the host
+    // authors the fold itself, with the same chain the fallback path uses,
+    // and then answers from the checkpoint that fold produced.
+    if checkpoint.is_none()
+        && dsh_compaction::authored_compaction_enabled(&config)
+        && dsh_compaction::refuse_without_checkpoint(&config)
+        && dsh_compaction::preflight_fold_enabled(&config)
+        && state.sessions.has_foldable_ranges(&key)
+    {
+        let limit = state
+            .sessions
+            .context_limit_of(&key)
+            .unwrap_or_else(|| context_limit(headers));
+        if let Some(note) = run_planned_fold(state, &key, limit, "compaction-preflight").await {
+            eprintln!(
+                "[billion-context-proxy] dsh compaction call identified ({identified}, {messages} msgs, \
+                 conv={key}) - {note}"
+            );
+        }
+        checkpoint = state.sessions.authored_checkpoint(&key);
+    }
+
+    if let Some(checkpoint) = checkpoint
+        && let Some(answer) = dsh_compaction::build_answer(protocol, &checkpoint.text, stream)
+    {
+        eprintln!(
+            "[billion-context-proxy] dsh compaction call identified ({identified}, {messages} msgs, conv={key}) \
+             - ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint, blocks={}): \
+             upstream not contacted",
+            checkpoint.blocks.join("+")
+        );
+        return Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, answer.content_type)
+                .header("x-bili-gate", "dsh-compaction-authored")
+                .body(Body::from(answer.body))
+                .unwrap_or_else(|err| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("local compaction answer build failed: {err}"),
+                    )
+                }),
+        );
+    }
+
+    if !dsh_compaction::refuse_without_checkpoint(&config) {
+        eprintln!(
+            "[billion-context-proxy] dsh compaction call identified ({identified}, {messages} msgs, conv={key}) \
+             - no active block, forwarded (dsh.authoredCompactionRefuse=false)"
+        );
+        return None;
+    }
+    eprintln!(
+        "[billion-context-proxy] dsh compaction call identified ({identified}, {messages} msgs, conv={key}) \
+         - REFUSED, not forwarded: bili owns compression on this lane (#1729); an active block is \
+         required before bili can answer with its snapshot"
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-bili-gate", "dsh-compaction-refused")
+            .body(Body::from(dsh_compaction::refusal_body(protocol)))
+            .unwrap_or_else(|err| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("refusal body build failed: {err}"),
+                )
+            }),
+    )
+}
+
+/// What the host actually did while preparing this request, so the ledger can
+/// report request-scoped prune facts instead of session totals.
+struct PrepareTrace {
+    protocol: &'static str,
+    /// `Some` only when a kernel prepare ran; the report then describes this
+    /// request's own prune attempt.
+    prune: Option<crate::prune::PruneReport>,
+}
+
 /// Rewrite an Anthropic Messages body through the kernel. Failure to parse or
 /// to recognize the wire leaves the request untouched (fail-open: a broken
 /// rewrite must never cost the user a turn).
-fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: Bytes) -> Bytes {
+fn maybe_prepare(
+    state: &AppState,
+    target: &str,
+    headers: &HeaderMap,
+    payload: Bytes,
+) -> (Bytes, Option<PrepareTrace>) {
+    let protocol = if target.contains("/chat/completions") {
+        "openai"
+    } else {
+        "anthropic"
+    };
     if state.passthrough || !target_has_model_wire(target) {
-        return payload;
+        return (payload, None);
     }
     let Ok(mut body) = serde_json::from_slice::<Value>(&payload) else {
-        return payload;
+        return (
+            payload,
+            Some(PrepareTrace {
+                protocol,
+                prune: None,
+            }),
+        );
     };
     if body.get("messages").and_then(Value::as_array).is_none() {
-        return payload;
+        return (
+            payload,
+            Some(PrepareTrace {
+                protocol,
+                prune: None,
+            }),
+        );
     }
     let key = conversation_key(headers, &body);
-    let context_limit = context_limit(headers);
     let plugin_mode = headers.contains_key("x-bili-plugin");
-    let reset_window =
-        headers.contains_key("x-bili-plugin-reset") || headers.contains_key("x-bili-context-reset");
     let model = headers
         .get("x-bili-plugin-model")
         .and_then(|value| value.to_str().ok())
@@ -856,18 +1199,33 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
+    // Phase 3.2: header (plugin wire) > `modelPolicies` > default 200k.
+    let context_limit = context_limit_for(headers, model.as_deref());
     let openai_wire = target.contains("/chat/completions");
+    let artifacts_available = state.sessions.artifact_store().is_some();
     if openai_wire {
-        let token_count = (openai::estimate_body_tokens(&body) as u32).saturating_add(800);
+        let raw_input = openai::estimate_message_tokens(&body) as u32;
+        let mut fixed_overhead =
+            (openai::estimate_fixed_overhead(&body) as u32).saturating_add(800);
+        if !plugin_mode {
+            fixed_overhead =
+                fixed_overhead.saturating_add(advertised_tools_estimate(artifacts_available));
+        }
         let converted = openai::to_core(&body);
-        let prepared = state.sessions.prepare_with_reset(
+        let prepared = state.sessions.prepare_with_budget(
             &key,
             context_limit,
             &converted.messages,
-            token_count,
+            raw_input,
+            fixed_overhead,
             model.clone(),
-            reset_window,
         );
+        // Phase 3.2: the routed model's policy also owns the compress knobs.
+        if let Some(policy) = policy_for(model.as_deref()) {
+            state
+                .sessions
+                .apply_model_policy(&key, context_limit, &policy);
+        }
         state
             .sessions
             .set_meta(&key, "openai", &upstream_base(target));
@@ -878,26 +1236,74 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
             openai::inject_user_note(&mut body, note);
         }
         if !plugin_mode {
-            openai::inject_tools(&mut body, &public_tools());
+            let defs = advertised_tools(artifacts_available);
+            openai::inject_tools(&mut body, &defs);
         }
         if state.debug {
             eprintln!(
-                "[billion-context-proxy] prepared openai {key}: {} messages, tokens {}",
+                "[billion-context-proxy] prepared openai {key}: {} messages, raw {} + fixed {} = effective {}",
                 body["messages"].as_array().map(Vec::len).unwrap_or(0),
-                token_count
+                raw_input,
+                fixed_overhead,
+                prepared.effective_projection_estimate
             );
         }
-        return match serde_json::to_vec(&body) {
+        let payload = match serde_json::to_vec(&body) {
             Ok(bytes) => Bytes::from(bytes),
             Err(_) => payload,
         };
+        return (
+            payload,
+            Some(PrepareTrace {
+                protocol: "openai",
+                prune: prepared.prune,
+            }),
+        );
     }
-    let token_count = (anthropic::estimate_body_tokens(&body) as u32).saturating_add(800);
-    let converted = anthropic::to_core(&body);
-    let prepared =
+    let raw_input = anthropic::estimate_message_tokens(&body) as u32;
+    let mut fixed_overhead = (anthropic::estimate_fixed_overhead(&body) as u32).saturating_add(800);
+    if !plugin_mode {
+        fixed_overhead =
+            fixed_overhead.saturating_add(advertised_tools_estimate(artifacts_available));
+    }
+    let mut converted = match anthropic::to_core(&body) {
+        Ok(converted) => converted,
+        Err(err) => {
+            // The adapter rejects shapes Node also rejects. Keep the existing
+            // fail-open contract: forward the original wire instead of
+            // synthesizing an empty conversation.
+            if state.debug {
+                eprintln!("[billion-context-proxy] anthropic wire rejected by adapter: {err}");
+            }
+            return (
+                payload,
+                Some(PrepareTrace {
+                    protocol,
+                    prune: None,
+                }),
+            );
+        }
+    };
+    let routed_model = model.clone();
+    let prepared = state.sessions.prepare_with_budget(
+        &key,
+        context_limit,
+        &converted.messages,
+        raw_input,
+        fixed_overhead,
+        model,
+    );
+    // Phase 3.2: apply the routed model's compress knobs to this conversation.
+    if let Some(policy) = policy_for(routed_model.as_deref()) {
         state
             .sessions
-            .prepare(&key, context_limit, &converted.messages, token_count, model);
+            .apply_model_policy(&key, context_limit, &policy);
+    }
+    // A pruned tool result must be rendered from its stable preview, not from
+    // the original raw block kept for image/error round-trips.
+    for id in &prepared.pruned_ids {
+        converted.sidecar.raw_blocks.remove(id);
+    }
     state
         .sessions
         .set_meta(&key, "anthropic", &upstream_base(target));
@@ -911,35 +1317,43 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
     // The plugin lane serves tool definitions through the manifest and lets the
     // host inject them; only the direct wire lane needs the proxy to append them.
     if !plugin_mode {
-        let defs = public_tools();
+        let defs = advertised_tools(artifacts_available);
         anthropic::inject_tools(&mut body, &defs);
     }
     if state.debug {
         eprintln!(
-            "[billion-context-proxy] prepared {key}: {} -> {} messages, tokens {}",
+            "[billion-context-proxy] prepared {key}: {} -> {} messages, raw {} + fixed {} = effective {}",
             body["messages"].as_array().map(Vec::len).unwrap_or(0),
             rebuilt_len(&body),
-            token_count
+            raw_input,
+            fixed_overhead,
+            prepared.effective_projection_estimate
         );
     }
-    match serde_json::to_vec(&body) {
+    let payload = match serde_json::to_vec(&body) {
         Ok(bytes) => Bytes::from(bytes),
         Err(_) => payload,
-    }
+    };
+    (
+        payload,
+        Some(PrepareTrace {
+            protocol: "anthropic",
+            prune: prepared.prune,
+        }),
+    )
 }
 
 fn target_has_model_wire(target: &str) -> bool {
     target.contains("/v1/messages") || target.contains("/chat/completions")
 }
 
+/// Origin kept for host-owned metadata: scheme, host and port only.
+///
+/// The routed target may carry userinfo or query credentials; neither may reach
+/// `/health`, the upstream failure table, a ledger field or a log, so the raw
+/// prefix is never retained. Routing itself still uses the original target.
 fn upstream_base(target: &str) -> String {
-    let scheme_end = target.find("://").map(|index| index + 3);
-    let rest_start = scheme_end.unwrap_or(0);
-    let host_end = target[rest_start..]
-        .find('/')
-        .map(|index| rest_start + index)
-        .unwrap_or(target.len());
-    target[..host_end].to_string()
+    pricing::redacted_origin(target)
 }
 
 fn rebuilt_len(body: &Value) -> usize {
@@ -970,13 +1384,50 @@ fn conversation_key(headers: &HeaderMap, body: &Value) -> String {
         .unwrap_or_else(|| "wire-default".to_string())
 }
 
-fn context_limit(headers: &HeaderMap) -> u32 {
+/// Phase 3.2: read `modelPolicies` from billion-context.json for this model.
+/// Only consulted for fields the wire does not carry itself, so the plugin
+/// path (which knows the real window) is never overridden by a stale table.
+fn policy_for(model: Option<&str>) -> Option<session_store::ModelPolicy> {
+    let model = model?;
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let policy = session_store::model_policy(&text, model);
+    (policy.context_window.is_some()
+        || policy.min_compress_range.is_some()
+        || policy.max_summary_length.is_some())
+    .then_some(policy)
+}
+
+fn context_limit_for(headers: &HeaderMap, model: Option<&str>) -> u32 {
     headers
         .get("x-bili-plugin-context-window")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| (1024..=2_000_000).contains(value))
+        .or_else(|| policy_for(model).and_then(|policy| policy.context_window))
         .unwrap_or(200_000)
+}
+
+fn context_limit(headers: &HeaderMap) -> u32 {
+    context_limit_for(headers, None)
+}
+
+/// The tool surface this host can actually serve right now.
+///
+/// `public_tools()` is the full registry; a host without an artifact store
+/// cannot answer the four artifact-backed tools, so it must not advertise them.
+/// Advertising a tool the dispatcher will refuse teaches the model to call it
+/// and then fails the call — the surface and the gate have to agree.
+fn advertised_tools(artifacts_available: bool) -> Vec<Value> {
+    tool_runner::servable(&public_tools(), artifacts_available)
+}
+
+/// Token cost of the surface actually injected. The estimate has to track
+/// [`advertised_tools`], otherwise a host without an artifact store reserves
+/// room for tool definitions it never sends.
+fn advertised_tools_estimate(artifacts_available: bool) -> u32 {
+    serde_json::to_string(&advertised_tools(artifacts_available))
+        .map(|text| anthropic::estimate_tokens(&text) as u32)
+        .unwrap_or(0)
 }
 
 /// Public tool surface: the Node proxy's names and schemas, shared by the DSH
@@ -985,13 +1436,19 @@ fn public_tools() -> Vec<Value> {
     let tools = json!([
         {
             "name": "compress",
-            "description": "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).",
+            "description": "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call — pass `content` as ONE string holding every block, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a JSON array of {startId,endId,summary,topic?} entries is also accepted).",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "ONE JSON-escaped string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown."
+                        "description": "ONE string holding ALL ranges: each block starts with its 'm00150–m00220 optional topic' header line, followed by that block's summary markdown. Escape it for JSON (quotes as \\\" and newlines as \\n); a JSON-encoded array of {startId,endId,summary,topic?} entries is also accepted."
+                    },
+                    "summaryMaxChars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 250000,
+                        "description": "Optional per-call ceiling for each summary in characters, overriding the session's configured maxSummaryLength for this call only. Use it when a summary is legitimately longer than the default (the refusal text names the ceiling it hit); the limit is restored afterwards."
                     }
                 }
             }
@@ -1023,6 +1480,70 @@ fn public_tools() -> Vec<Value> {
             }
         },
         {
+            "name": "artifact_info",
+            "description": "Inspect metadata for an artifact-backed tool output. Pass artifact_id or a stable message ref. Does not return the full body.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "string"},
+                    "ref": {"type": "string", "description": "Optional mNNNNN ref whose artifact should be resolved"}
+                }
+            }
+        },
+        {
+            "name": "artifact_read",
+            "description": "Read a bounded byte range from an artifact-backed tool output. Pass artifact_id or ref; offset/limit are byte-oriented and hard-capped. Original bytes are only available when the host stored them.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "offset": {"type": "number", "description": "Byte offset, default 0"},
+                    "limit": {"type": "number", "description": "Max bytes, default 8192, hard cap 64 KiB"}
+                }
+            }
+        },
+        {
+            "name": "artifact_search",
+            "description": "Search one artifact-backed tool output by literal keyword. Results are bounded in count and returned bytes; the full artifact is never injected automatically.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "number", "description": "Max hits, default 5, cap 20"},
+                    "max_bytes": {"type": "number", "description": "Max returned text bytes, default 4096, cap 32 KiB"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "retrieve_raw",
+            "description": "Return the archived ORIGINAL of a folded range, explicitly and bounded (never injected automatically). Address it by `refs` (mNNNNN message refs) or by `block` (bN block id listed in acp_status foldArchives). If no artifact holds the span the answer is OriginalUnavailable; nothing is pretended. `retrieve` with mode=\"original\" reaches the same path.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "refs": {"type": "array", "items": {"type": "string"}, "description": "Message refs (mNNNNN) whose folded original should be read"},
+                    "block": {"type": "string", "description": "Folded block id (bN) from acp_status foldArchives"},
+                    "offset": {"type": "number", "description": "Byte offset per ref, default 0"},
+                    "limit": {"type": "number", "description": "Max bytes per ref, default 8192, hard cap 64 KiB"}
+                }
+            }
+        },
+        {
+            "name": "reset_window",
+            "description": "Explicit last-resort fresh-window reset (never automatic): drop this conversation's folded blocks and start a new window seeded with a task brief plus the last few messages. Archived originals stay reachable by artifact id and the reset is recorded in acp_status freshWindow. This is not compression.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why the reset is needed (recorded in the receipt)"},
+                    "brief": {"type": "string", "description": "Task brief to carry into the new window; defaults to the last user message"},
+                    "keepRecent": {"type": "number", "description": "Tail messages kept verbatim, default 6, cap 32"}
+                }
+            }
+        },
+        {
             "name": "acp_status",
             "description": "Context usage overview, compressible ranges, block drilldown.",
             "input_schema": {
@@ -1048,7 +1569,12 @@ fn public_tools() -> Vec<Value> {
 }
 
 async fn manifest_handler(State(state): State<Arc<AppState>>) -> Response {
-    let tools = Value::Array(public_tools());
+    // Advertise only what this host can serve. The host registers whatever is
+    // listed here and then calls it; listing an artifact tool on a host with no
+    // artifact store produces a guaranteed failed call for a tool the model was
+    // explicitly told exists.
+    let artifacts_available = state.sessions.artifact_store().is_some();
+    let tools = Value::Array(advertised_tools(artifacts_available));
     let names: Vec<&str> = tools
         .as_array()
         .map(|list| {
@@ -1057,14 +1583,46 @@ async fn manifest_handler(State(state): State<Arc<AppState>>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
+    // A name in the full registry that the dispatcher cannot resolve is a
+    // broken surface, not a cosmetic bug: the host registers it, the model calls
+    // it, and nothing runs. Checked against the full registry so filtering for
+    // availability can never hide the mismatch.
+    let registry = public_tools();
+    let registry_names: Vec<&str> = registry
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
+    let unresolved = tool_runner::unresolved(&registry_names);
+    // Same servable surface, OpenAI dialect. The bridge in this profile reads
+    // `tools.anthropic` (it serves MCP `tools/list` from it), so this half is
+    // inert today — but publishing `[]` claimed the host serves no tools to any
+    // OpenAI-protocol reader, which was simply false. `responses` stays empty on
+    // purpose: no consumer reads it and its item shape is unverified here, so
+    // inventing one would be worse than saying nothing.
+    let openai_tools =
+        tool_runner::openai_tools(tools.as_array().map(Vec::as_slice).unwrap_or_default());
     axum::Json(json!({
         "ok": true,
         "protocolVersion": 1,
         "proxy": state.origin,
         "version": VERSION,
         "commit": "rust",
+        "build": build_id::BuildInfo::current().json(),
         "toolNames": names,
-        "tools": { "anthropic": tools, "openai": [], "responses": [] },
+        "tools": { "anthropic": tools, "openai": openai_tools, "responses": [] },
+        "registry": {
+            "advertised": names.len(),
+            "implemented": tool_runner::IMPLEMENTED.len(),
+            // Advertised is what the host registers; dispatchable is every name
+            // `Store::tool` answers, aliases included. They are reported apart
+            // because a canonical name missing from the dispatchable set would
+            // pass the gate and then fall into `[unknown tool]`.
+            "dispatchable": tool_runner::DISPATCHED.len(),
+            "openaiAdvertised": openai_tools.len(),
+            "unresolved": unresolved,
+            "artifactsAvailable": artifacts_available,
+            "withheld": tool_runner::withheld(artifacts_available),
+        },
         "headers": {
             "agent": "x-bili-plugin",
             "conversation": "x-bili-plugin-conversation",
@@ -1102,20 +1660,327 @@ async fn plugin_tool_handler(
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| conversation_key(&headers, &parsed));
-    let limit = context_limit(&headers);
+    // Tool calls arrive without `x-bili-plugin-context-window`; falling back to
+    // the bare default would rebuild the whole session inside `with_entry`
+    // (refs/folds/token counters cleared), which makes every ref the nudge just
+    // offered an `unknown_ref`. Prefer the limit this conversation was last
+    // prepared with; only fall back to the header/default for an unseen key.
+    let limit = state
+        .sessions
+        .context_limit_of(&key)
+        .unwrap_or_else(|| context_limit(&headers));
     let args = parsed.get("args").cloned().unwrap_or_else(|| json!({}));
-    let (text, outcome, blocks) = state.sessions.tool(&key, limit, tool, &args);
+    // Fail closed before any dispatch: an unimplemented name and a tool whose
+    // backing store is missing both used to come back as `ok: true` carrying a
+    // prose apology, which the host accepted as a delivered result. The gate
+    // answers with a non-2xx status and `ok: false` instead, so the call reads
+    // as failed at the only place the model can see it.
+    let artifacts_available = state.sessions.artifact_store().is_some();
+    let canonical = match tool_runner::check(tool, &args, artifacts_available) {
+        Ok(canonical) => canonical,
+        Err(refusal) => {
+            eprintln!(
+                "[billion-context-proxy] plugin tool refused before dispatch ({key}): {} ({})",
+                refusal.code(),
+                tool
+            );
+            let status = StatusCode::from_u16(refusal.status()).unwrap_or(StatusCode::BAD_REQUEST);
+            return (
+                status,
+                axum::Json(tool_runner::refusal_body(&refusal, tool, &key)),
+            )
+                .into_response();
+        }
+    };
+    // Dispatch the canonical name, not the raw one. The gate resolved an alias
+    // to the branch that implements it; forwarding the raw spelling would let
+    // the gate and the dispatcher disagree on names the alias table covers but
+    // the match arms do not, so a call the gate approved would land in the
+    // `[unknown tool]` fallback and report `refused`.
+    let args = external_summary_args(&state, &key, canonical, args).await;
+    let (text, outcome, blocks) = state.sessions.tool(&key, limit, canonical, &args);
     let mut reply = json!({
         "ok": true,
         "tool": tool,
+        "canonicalTool": canonical,
         "conversationId": key,
-        "outcome": outcome.unwrap_or("success"),
+        // Every dispatch branch states its own outcome. Reporting "success" for
+        // an absent one would turn a dispatcher bug into a delivered result.
+        // `failure` is the only honest default: the host marks a call failed on
+        // `failure`/`refused` and ignores any outcome word it does not know.
+        "outcome": outcome.unwrap_or("failure"),
         "result": text,
     });
     if let Some(blocks) = blocks {
         reply["blocksCreated"] = json!(blocks);
     }
     axum::Json(reply).into_response()
+}
+
+/// Optional external-summary preflight for a `compress` tool call
+/// (`compress.externalSummary`, plan §2.1).
+///
+/// Returns the args unchanged whenever the chain is off, the tool is something
+/// else, or the summarizer produced nothing. Fail-open is deliberate: keeping
+/// the model's own summary keeps a fold landable when the cheap model is down,
+/// which is the difference from the Node proxy documented in §2.8.
+async fn external_summary_args(
+    state: &Arc<AppState>,
+    key: &str,
+    tool_name: &str,
+    args: Value,
+) -> Value {
+    if tool_name != "compress" && tool_name != "acp_compress" {
+        return args;
+    }
+    let Some(chain) = external_summary_chain() else {
+        return args;
+    };
+    let inputs = state.sessions.range_inputs(key, &args);
+    if inputs.is_empty() {
+        return args;
+    }
+    match summarizer::summarize(&chain, &inputs).await {
+        Some(batch) => {
+            let first = &chain.targets[0];
+            eprintln!(
+                "[billion-context-proxy] compress.externalSummary: authored {} range summary(ies) with {}/{} ({} provider call(s), {} estimated)",
+                batch.summaries.len(),
+                first.recipe.name,
+                first.model,
+                batch.calls,
+                batch.estimated_calls
+            );
+            state.sessions.record_summary_usage(key, false, &batch);
+            session_store::apply_external_summaries(&args, &batch.summaries)
+        }
+        None => {
+            eprintln!(
+                "[billion-context-proxy] compress.externalSummary: chain produced no summary, folding with the model-authored text"
+            );
+            args
+        }
+    }
+}
+
+fn external_summary_chain() -> Option<summarizer::ExternalSummary> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let document: Value = serde_json::from_str(&text).ok()?;
+    summarizer::from_config(&document).filter(summarizer::ExternalSummary::is_active)
+}
+
+/// P1 auto fallback is opt-in: `BILI_AUTO_FALLBACK=1` (or true/on/yes) turns it
+/// on regardless of config, `0`/anything else in the env turns it off; without
+/// the env var the config key `compress.autoFallback.enabled` decides, default
+/// false. Resolved once at startup so a per-request config read cannot flip it
+/// mid-conversation.
+fn auto_fallback_enabled() -> bool {
+    if let Some(value) = env_str("BILI_AUTO_FALLBACK") {
+        let value = value.trim().to_ascii_lowercase();
+        if !value.is_empty() {
+            return matches!(value.as_str(), "1" | "true" | "on" | "yes");
+        }
+    }
+    let Some(text) = std::fs::read_to_string(config_path()).ok() else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    document
+        .get("compress")
+        .and_then(|compress| compress.get("autoFallback"))
+        .and_then(|fallback| fallback.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Phase 3.1 speculation is opt-in: `BILI_SPECULATION=1` (or true/on/yes), else
+/// the config key `compress.speculation.enabled`, default false. Resolved once
+/// at startup like the fallback switch.
+fn speculation_enabled() -> bool {
+    if let Some(value) = env_str("BILI_SPECULATION") {
+        let value = value.trim().to_ascii_lowercase();
+        if !value.is_empty() {
+            return matches!(value.as_str(), "1" | "true" | "on" | "yes");
+        }
+    }
+    let Some(text) = std::fs::read_to_string(config_path()).ok() else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    document
+        .get("compress")
+        .and_then(|compress| compress.get("speculation"))
+        .and_then(|speculation| speculation.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// P1: when the model ignored the nudge twice, or the projection crossed the
+/// pressure line, the host folds the oldest foldable range itself through the
+/// configured summarizer chain. Runs before the request is projected so the
+/// turn that triggered it already shrinks. Every path ends with
+/// `apply_fallback` or `abort_fallback`: a dead chain must not leave a range
+/// stuck in flight.
+async fn maybe_auto_fallback(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    payload: &axum::body::Bytes,
+) -> Option<String> {
+    let body: Value = serde_json::from_slice(payload).ok()?;
+    let key = conversation_key(headers, &body);
+    let model = headers
+        .get("x-bili-plugin-model")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let limit = state
+        .sessions
+        .context_limit_of(&key)
+        .unwrap_or_else(|| context_limit_for(headers, model.as_deref()));
+    run_planned_fold(state, &key, limit, "autoFallback").await
+}
+
+/// Land one host-initiated fold: plan → chain → inputs → budget → summarize →
+/// `apply_fallback`.
+///
+/// Shared by the pre-request fallback and the compaction path's
+/// fold-before-refuse: both need a summary the model never authored, and both
+/// must leave every exit path with a landed fold or an abort. `source` prefixes
+/// the diagnostics so the two callers stay distinguishable in the log.
+async fn run_planned_fold(
+    state: &Arc<AppState>,
+    key: &str,
+    limit: u32,
+    source: &str,
+) -> Option<String> {
+    let plan = state.sessions.fallback_plan(key)?;
+    let reason = plan.reason;
+    let range_count = plan.ranges.len();
+    let Some(chain) = external_summary_chain() else {
+        state.sessions.abort_fallback(key, "no_chain");
+        return Some(format!(
+            "{source} skipped ({reason}): no summarizer chain is configured"
+        ));
+    };
+    let inputs = state.sessions.fallback_inputs(key, &plan);
+    if inputs.is_empty() {
+        state.sessions.abort_fallback(key, "no_input");
+        return Some(format!(
+            "{source} skipped ({reason}): no range text is available to summarize"
+        ));
+    }
+    if let Err(refusal) = state.sessions.reserve_summary_call(
+        key,
+        false,
+        chain.settings.max_calls_per_session,
+        chain.settings.max_speculation_calls,
+    ) {
+        state.sessions.abort_fallback(key, "budget");
+        return Some(format!(
+            "{source} skipped ({reason}): {refusal}; the projection was left untouched"
+        ));
+    }
+    let Some(batch) = summarizer::summarize(&chain, &inputs).await else {
+        state.sessions.abort_fallback(key, "chain_failed");
+        return Some(format!(
+            "{source} failed ({reason}): the summarizer chain returned nothing"
+        ));
+    };
+    if batch.summaries.is_empty() {
+        state.sessions.abort_fallback(key, "empty_summary");
+        return Some(format!(
+            "{source} failed ({reason}): the summarizer chain returned no text"
+        ));
+    }
+    state.sessions.record_summary_usage(key, false, &batch);
+    let summaries = batch.summaries;
+    let landing = state
+        .sessions
+        .apply_fallback(key, limit, plan, &summaries, now_ms())
+        .unwrap_or_else(|| "(no attempt was in flight)".to_string());
+    Some(format!(
+        "{source} {reason} over {range_count} range(s): {landing}"
+    ))
+}
+
+/// Phase 3.1: open a candidate in the 45–75% band and distill the old T1
+/// blocks off the request path. The candidate carries signatures; when the
+/// chain answers, `apply_speculation` refuses to land anything whose blocks
+/// moved in the meantime. A dead chain releases the marker so later turns can
+/// try again.
+async fn maybe_background_speculation(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    payload: axum::body::Bytes,
+) {
+    let Ok(body) = serde_json::from_slice::<Value>(&payload) else {
+        return;
+    };
+    let key = conversation_key(&headers, &body);
+    let model = headers
+        .get("x-bili-plugin-model")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let limit = state
+        .sessions
+        .context_limit_of(&key)
+        .unwrap_or_else(|| context_limit_for(&headers, model.as_deref()));
+    let Some(plan) = state.sessions.speculation_plan(&key) else {
+        return;
+    };
+    let Some(chain) = external_summary_chain() else {
+        state.sessions.abort_speculation(&key, "no_chain");
+        return;
+    };
+    let inputs: Vec<summarizer::RangeInput> = plan
+        .blocks
+        .iter()
+        .zip(plan.inputs.iter())
+        .map(|(block, text)| summarizer::RangeInput {
+            label: block.clone(),
+            topic: None,
+            text: text.clone(),
+        })
+        .collect();
+    if inputs.is_empty() {
+        state.sessions.abort_speculation(&key, "no_input");
+        return;
+    }
+    if let Err(refusal) = state.sessions.reserve_summary_call(
+        &key,
+        true,
+        chain.settings.max_calls_per_session,
+        chain.settings.max_speculation_calls,
+    ) {
+        state.sessions.abort_speculation(&key, "budget");
+        eprintln!("[billion-context-proxy] speculation skipped: {refusal}");
+        return;
+    }
+    tokio::spawn(async move {
+        let Some(batch) = summarizer::summarize(&chain, &inputs).await else {
+            state.sessions.abort_speculation(&key, "chain_failed");
+            return;
+        };
+        state.sessions.record_summary_usage(&key, true, &batch);
+        let note = state
+            .sessions
+            .apply_speculation(&key, limit, plan, &batch.summaries, now_ms())
+            .unwrap_or_else(|| "(the candidate was already resolved)".to_string());
+        eprintln!("[billion-context-proxy] {note}");
+    });
 }
 
 async fn plugin_status_handler(
@@ -1127,7 +1992,7 @@ async fn plugin_status_handler(
         .filter(|value| !value.trim().is_empty())
     {
         match state.sessions.status_json(conversation) {
-            Some(status) => return axum::Json(status).into_response(),
+            Some(status) => return axum::Json(with_summary_budget_limits(status)).into_response(),
             None if query.get("fallback").map(String::as_str) != Some("latest") => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1138,10 +2003,32 @@ async fn plugin_status_handler(
             None => {}
         }
     }
-    axum::Json(state.sessions.latest_status_json().unwrap_or_else(
-        || json!({"ok": true, "phase": "pre-first-request", "blocks": [], "viaFallback": true}),
+    axum::Json(with_summary_budget_limits(
+        state.sessions.latest_status_json().unwrap_or_else(
+            || json!({"ok": true, "phase": "pre-first-request", "blocks": [], "viaFallback": true}),
+        ),
     ))
     .into_response()
+}
+
+/// Task 2: attach the live chain budget to the per-session status so the panel
+/// shows the ceiling next to the spend. The limits are read from the same config
+/// the dispatch path uses, so the two can never disagree.
+fn with_summary_budget_limits(mut status: Value) -> Value {
+    if let Some(chain) = external_summary_chain()
+        && let Some(budget) = status.get_mut("summaryBudget")
+    {
+        budget["limits"] = json!({
+            "maxCallsPerSession": chain.settings.max_calls_per_session,
+            "maxSpeculationCalls": chain.settings.max_speculation_calls,
+            "maxInputChars": chain.settings.max_input_chars,
+            "maxOutputTokens": chain.settings.max_output_tokens,
+            "maxSummaryBytes": chain.settings.max_summary_bytes,
+            "totalTimeoutMs": chain.settings.total_timeout_ms,
+            "enabled": chain.is_active(),
+        });
+    }
+    status
 }
 
 async fn runtime_info_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -1150,6 +2037,7 @@ async fn runtime_info_handler(State(state): State<Arc<AppState>>) -> Response {
         "runtime": "rust",
         "version": VERSION,
         "commit": "rust",
+        "build": build_id::BuildInfo::current().json(),
         "host": state.host,
         "port": state.port,
         "origin": state.origin,
@@ -1173,6 +2061,7 @@ async fn global_status_handler(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(json!({
         "version": VERSION,
         "commit": "rust",
+        "build": build_id::BuildInfo::current().json(),
         "origin": state.origin,
         "diskVersion": VERSION,
         "stale": false,
@@ -1203,6 +2092,10 @@ async fn overview_handler(State(state): State<Arc<AppState>>) -> Response {
 async fn pricing_handler(State(state): State<Arc<AppState>>) -> Response {
     let path = config_path();
     let mut value = state.sessions.pricing_json(&path.to_string_lossy());
+    // The plugin's published snapshot, read-only. `price: null` above means "no
+    // operator override", not "free"; this block says whether a real published
+    // price is available and how old it is.
+    value["snapshot"] = pricing::snapshot_status(now_ms());
     if let Ok(raw) = std::fs::read_to_string(&path) {
         if let Ok(config) = serde_json::from_str::<Value>(&raw) {
             if let Some(prices) = config
@@ -1229,8 +2122,8 @@ async fn pricing_handler(State(state): State<Arc<AppState>>) -> Response {
 fn config_key_is_secret(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     let compact: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    // Match secret-shaped names, not every name containing the substring: `maxTokens`
-    // and `prompt_tokens` are limits/counts, not credentials.
+    // Match secret-shaped names, not every name containing the substring:
+    // `maxTokens` and `prompt_tokens` are limits/counts, not credentials.
     let words: Vec<&str> = key
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -1412,6 +2305,7 @@ fn update_state_json() -> Value {
     json!({
         "running": VERSION,
         "disk": VERSION,
+        "build": build_id::BuildInfo::current().json(),
         "pendingRestart": false,
         "updateAvailable": false,
         "critical": false,
@@ -1434,7 +2328,7 @@ async fn update_check_handler() -> Response {
 }
 
 /// Guard the admin surface: loopback Host only, loopback/allowlisted browser
-/// origins, and a launcher-provided token for state-changing routes.  CORS is
+/// origins, and a launcher-provided token for state-changing routes. CORS is
 /// emitted from the same allowlist instead of the previous wildcard.
 async fn admin_guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     if !req.uri().path().starts_with("/__bili") {
@@ -1594,6 +2488,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
         "ok": true,
         "upstream": upstream,
         "version": VERSION,
+        "build": build_id::BuildInfo::current().json(),
         "instanceId": state.instance_id,
         "pid": std::process::id(),
         "startedAt": state.started_at,
@@ -1691,6 +2586,62 @@ async fn main() {
             opts.host
         );
     }
+    let credential =
+        d1b_runner::credential_status(crate::summarizer::EXTERNAL_SUMMARY_CREDENTIAL_ENV);
+    eprintln!(
+        "[billion-context-proxy] external summary credential ({}) : {}",
+        crate::summarizer::EXTERNAL_SUMMARY_CREDENTIAL_ENV,
+        match credential {
+            d1b_runner::CredentialStatus::Present => "present",
+            d1b_runner::CredentialStatus::Missing => "missing",
+        }
+    );
+    if let Some(mut run) = opts.d1b.clone() {
+        let provider = run
+            .provider
+            .clone()
+            .unwrap_or_else(|| "oneagent".to_string());
+        let env_name = d1b_provider_credential_env(&provider);
+        if env_name.is_some() {
+            // `d1b_provider_credential_env` already checked the fixed
+            // allowlist; this method sets both provider and env together.
+            run.bind_credential(&provider).ok();
+        }
+        let credential = d1b_runner::credential_status(env_name.as_deref().unwrap_or(""));
+        eprintln!(
+            "[billion-context-proxy] d1b credential ({provider} / {}) : {}",
+            env_name.as_deref().unwrap_or("<unbound>"),
+            match credential {
+                d1b_runner::CredentialStatus::Present => "present",
+                d1b_runner::CredentialStatus::Missing => "missing",
+            }
+        );
+        run.sessions_dir = sessions_dir();
+        let report = d1b_runner::run(run).await;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| "{\"error\":\"report serialize\"}".into())
+        );
+        std::process::exit(d1b_runner::exit_code(&report));
+    }
+    if opts.cleanup_artifacts {
+        let store = session_store::Store::with_dir(sessions_dir().join("rust-sessions"));
+        match store.cleanup_artifacts_default() {
+            Ok(report) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|_| "{\"error\":\"report serialize\"}".into())
+                );
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("[billion-context-proxy] artifact cleanup refused: {err}");
+                std::process::exit(4);
+            }
+        }
+    }
     let (listener, bound_port) =
         match bind_with_ladder(&opts.host, opts.port, opts.strict_port).await {
             Ok(v) => v,
@@ -1717,6 +2668,9 @@ async fn main() {
         if m.is_empty() { None } else { Some(m) }
     };
     let mitm_domains = mitm_domains_from_env();
+    let upstream_allowlist = upstream_allowlist_from_env(&mitm_domains);
+    let allow_private_upstreams = env_str("BILI_ALLOW_PRIVATE_UPSTREAM").as_deref() == Some("1");
+    let admin_origins = admin_origins_from_env(&origin, bound_port);
     let sessions_dir = sessions_dir();
 
     let client = match reqwest::Client::builder()
@@ -1748,16 +2702,14 @@ async fn main() {
         sessions: session_store::Store::with_dir(sessions_dir.join("rust-sessions")),
         upstream: Mutex::new(env_str("BILI_UPSTREAM")),
         upstream_failures: Mutex::new(HashMap::new()),
+        usage_source: opts.usage_source,
+        auto_fallback: auto_fallback_enabled(),
+        speculation: speculation_enabled(),
         launch_token: launch_token.clone(),
-        admin_origins: admin_origins_from_env(&origin, bound_port),
-        upstream_allowlist: upstream_allowlist_from_env(&mitm_domains),
-        allow_private_upstreams: env_str("BILI_ALLOW_PRIVATE_UPSTREAM").as_deref() == Some("1"),
+        admin_origins,
+        upstream_allowlist,
+        allow_private_upstreams,
     });
-    if launch_token.is_none() {
-        eprintln!(
-            "[billion-context-proxy] warning: BILI_LAUNCH_TOKEN is unset; admin mutations are guarded only by loopback Host/Origin"
-        );
-    }
 
     let instance = ProxyInstanceFile {
         origin: origin.clone(),
@@ -1873,155 +2825,4 @@ async fn main() {
     }
     let _ = std::fs::remove_file(&registry_path);
     eprintln!("[billion-context-proxy] exited");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> AppState {
-        let (shutdown_tx, _) = watch::channel(false);
-        AppState {
-            client: reqwest::Client::new(),
-            origin: "http://127.0.0.1:18787".into(),
-            host: "127.0.0.1".into(),
-            port: 18787,
-            instance_id: "test".into(),
-            started_at: 0,
-            passthrough: false,
-            debug: false,
-            parent_pid: None,
-            watchers: Mutex::new(HashSet::new()),
-            shutdown_tx,
-            upstream: Mutex::new(None),
-            upstream_failures: Mutex::new(HashMap::new()),
-            sessions: session_store::Store::new(),
-            launch_token: Some("secret".into()),
-            admin_origins: vec!["http://127.0.0.1:18787".into()],
-            upstream_allowlist: vec!["api.openai.com".into(), "*.example.com".into()],
-            allow_private_upstreams: false,
-        }
-    }
-
-    #[test]
-    fn upstream_allowlist_is_exact_or_wildcard() {
-        let allow = vec!["api.openai.com".to_string(), "*.example.com".to_string()];
-        assert!(upstream_target_allowed(
-            "https://api.openai.com/v1/messages",
-            &allow,
-            false
-        ));
-        assert!(upstream_target_allowed(
-            "https://a.example.com/v1",
-            &allow,
-            false
-        ));
-        assert!(!upstream_target_allowed(
-            "https://example.com/v1",
-            &allow,
-            false
-        ));
-        assert!(!upstream_target_allowed(
-            "https://api.openai.com.evil.test/v1",
-            &allow,
-            false
-        ));
-        assert!(!upstream_target_allowed(
-            "http://127.0.0.1:18080/v1",
-            &allow,
-            false
-        ));
-        assert!(!upstream_target_allowed(
-            "file:///etc/passwd",
-            &allow,
-            false
-        ));
-        assert!(!upstream_target_allowed(
-            "https://user:pass@api.openai.com/v1",
-            &allow,
-            false
-        ));
-    }
-
-    #[test]
-    fn private_upstreams_require_explicit_opt_in() {
-        assert!(upstream_target_allowed(
-            "http://127.0.0.1:18080/v1",
-            &[],
-            true
-        ));
-        assert!(upstream_target_allowed(
-            "http://127.0.0.1:18080/v1",
-            &["127.0.0.1".into()],
-            false
-        ));
-    }
-
-    #[test]
-    fn host_and_origin_loopback_detection() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18787"));
-        assert!(host_header_is_loopback(&headers));
-        headers.insert(header::HOST, HeaderValue::from_static("[::1]:18787"));
-        assert!(host_header_is_loopback(&headers));
-        headers.insert(header::HOST, HeaderValue::from_static("evil.test"));
-        assert!(!host_header_is_loopback(&headers));
-        let state = state();
-        assert!(admin_origin_allowed("http://127.0.0.1:54528", &state));
-        assert!(admin_origin_allowed("http://[::1]:54528", &state));
-        assert!(!admin_origin_allowed("http://evil.test", &state));
-        assert!(!admin_origin_allowed("null", &state));
-    }
-
-    #[test]
-    fn launch_token_only_required_for_mutations() {
-        let mut headers = HeaderMap::new();
-        assert!(!launch_token_ok(&headers, Some("secret")));
-        headers.insert("x-bili-launch-token", HeaderValue::from_static("wrong"));
-        assert!(!launch_token_ok(&headers, Some("secret")));
-        headers.insert("x-bili-launch-token", HeaderValue::from_static("secret"));
-        assert!(launch_token_ok(&headers, Some("secret")));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer secret"),
-        );
-        assert!(launch_token_ok(&headers, Some("secret")));
-        assert!(launch_token_ok(&headers, None));
-        assert!(!admin_mutation(&Method::GET, "/__bili/config"));
-        assert!(admin_mutation(&Method::PUT, "/__bili/config"));
-        assert!(!admin_mutation(&Method::POST, "/__bili/plugin/tool"));
-        assert!(!admin_mutation(&Method::POST, "/__bili/watcher"));
-        assert!(admin_mutation(&Method::POST, "/__bili/shutdown"));
-    }
-
-    #[test]
-    fn config_redaction_hides_credentials_recursively() {
-        let mut config = json!({
-            "providers": {
-                "openai": {"apiKey": "sk-live", "baseURL": "https://api.openai.com"},
-                "anthropic": {"api_key": "sk-ant", "headers": {"Authorization": "Bearer x"}}
-            },
-            "model": "gpt"
-        });
-        assert!(redact_config(&mut config));
-        assert_eq!(config["providers"]["openai"]["apiKey"], "***REDACTED***");
-        assert_eq!(
-            config["providers"]["anthropic"]["api_key"],
-            "***REDACTED***"
-        );
-        assert_eq!(
-            config["providers"]["anthropic"]["headers"]["Authorization"],
-            "***REDACTED***"
-        );
-        assert_eq!(config["model"], "gpt");
-        assert!(!config_key_is_secret("baseURL"));
-        assert!(!config_key_is_secret("maxTokens"));
-        assert!(!config_key_is_secret("max_tokens"));
-        assert!(!config_key_is_secret("prompt_tokens"));
-        assert!(!config_key_is_secret("token_count"));
-        assert!(!config_key_is_secret("tokenBudget"));
-        assert!(config_key_is_secret("access_token"));
-        assert!(config_key_is_secret("clientSecret"));
-        assert!(config_key_is_secret("secretKey"));
-    }
 }

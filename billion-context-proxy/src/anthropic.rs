@@ -80,27 +80,6 @@ fn stringify_input(input: &Value) -> String {
     serde_json::to_string(input).unwrap_or_else(|_| "{}".into())
 }
 
-fn tool_name_map(messages: &[Value]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    for message in messages {
-        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            if let (Some(id), Some(name)) = (
-                block.get("id").and_then(Value::as_str),
-                block.get("name").and_then(Value::as_str),
-            ) {
-                names.insert(id.to_string(), name.to_string());
-            }
-        }
-    }
-    names
-}
-
 fn block_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -110,6 +89,75 @@ fn block_text(content: &Value) -> String {
                 (block.get("type").and_then(Value::as_str) == Some("text"))
                     .then(|| block.get("text").and_then(Value::as_str))
                     .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// JavaScript `String(value)` for the scalar forms a text block can carry.
+/// Node's tool-result join stringifies the `text` value, so JSON `5`/`true`
+/// become `"5"`/`"true"`, while `null` and a missing field become `""`.
+/// `String(number)` formatting for the tolerant scalar `text` values: JSON has
+/// no `NaN`/`Infinity`, and JavaScript prints integral doubles without `.0`,
+/// switches to exponent form below `1e-6` and at/above `1e21`, and writes a
+/// signed positive exponent (`1e+21`).
+fn js_number(number: &serde_json::Number) -> String {
+    // JavaScript stores every JSON number as an IEEE-754 double, so a 64-bit
+    // integer literal beyond 2^53 is rounded before `String(...)` runs.
+    let Some(value) = number.as_f64() else {
+        return number.to_string();
+    };
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = value.abs();
+    if (1e-6..1e21).contains(&magnitude) {
+        if value.fract() == 0.0 {
+            return format!("{value:.0}");
+        }
+        return value.to_string();
+    }
+    let rendered = format!("{value:e}");
+    match rendered.split_once('e') {
+        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+            format!("{mantissa}e+{exponent}")
+        }
+        _ => rendered,
+    }
+}
+
+fn js_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => js_number(number),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| js_text(Some(item)))
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(Value::Object(_)) => "[object Object]".to_string(),
+    }
+}
+
+/// Node's tool-result text projection keeps one slot per content block:
+/// non-text blocks and absent/null text contribute an empty slot, then all
+/// slots are joined with `"\n"`. System text has different Node semantics
+/// (`[<type>]` markers), so it continues to use `block_text`.
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    js_text(block.get("text"))
+                } else {
+                    String::new()
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -134,14 +182,125 @@ fn media_fingerprint(block: &Value) -> Option<String> {
     source.get("url").and_then(Value::as_str).map(hash16)
 }
 
+/// Why an Anthropic body cannot be converted. The message mirrors the
+/// JavaScript `TypeError` the Node oracle throws on the same malformed wire, so
+/// probe and test output can compare the failure directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertError {
+    message: String,
+}
+
+impl ConvertError {
+    fn new(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConvertError {}
+
+/// Node's `anthropicToCore` does `typeof content === "string" ? ... :
+/// content.map(...)`, so a content field that is neither a string nor an array
+/// throws before any message is produced. Reproduce that rejection instead of
+/// turning it into an empty message.
+fn validate_content_shape(content: Option<&Value>) -> Result<(), ConvertError> {
+    match content {
+        Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(blocks)) => {
+            if blocks.iter().any(Value::is_null) {
+                Err(ConvertError::new(
+                    "TypeError: Cannot read properties of null (reading 'type')",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(ConvertError::new("TypeError: blocks is not iterable")),
+    }
+}
+
+/// The tool-result branch calls `.map` on `content` unless it is a string. A
+/// missing, null, scalar or object value throws exactly like Node; an array
+/// with a null element fails earlier at the element's `.type` read.
+fn validate_tool_result_content(content: Option<&Value>) -> Result<(), ConvertError> {
+    match content {
+        Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(blocks)) => {
+            if blocks.iter().any(Value::is_null) {
+                Err(ConvertError::new(
+                    "TypeError: Cannot read properties of null (reading 'type')",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Some(Value::Null) => Err(ConvertError::new(
+            "TypeError: Cannot read properties of null (reading 'map')",
+        )),
+        Some(_) => Err(ConvertError::new(
+            "TypeError: b2.content.map is not a function",
+        )),
+        None => Err(ConvertError::new(
+            "TypeError: Cannot read properties of undefined (reading 'map')",
+        )),
+    }
+}
+
+fn validate_messages(body: &Value) -> Result<(), ConvertError> {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ConvertError::new("TypeError: Cannot read properties of undefined (reading 'entries')")
+        })?;
+    for message in messages {
+        let Some(object) = message.as_object() else {
+            return Err(ConvertError::new("TypeError: blocks is not iterable"));
+        };
+        validate_content_shape(object.get("content"))?;
+        if let Some(Value::Array(blocks)) = object.get("content") {
+            for block in blocks {
+                let Some(block) = block.as_object() else {
+                    continue;
+                };
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    validate_tool_result_content(block.get("content"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert an Anthropic Messages request body into kernel messages.
-pub fn to_core(body: &Value) -> Converted {
+///
+/// # Errors
+/// Returns the Node-equivalent `TypeError` for a content field that is not a
+/// string or array, or an array containing `null`.
+pub fn to_core(body: &Value) -> Result<Converted, ConvertError> {
+    validate_messages(body)?;
+    Ok(convert_unchecked(body))
+}
+
+/// Conversion for a body already accepted by [`validate_messages`]. Kept
+/// separate so the public entry point has one validation point.
+fn convert_unchecked(body: &Value) -> Converted {
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let names = tool_name_map(&messages);
+    // Node learns tool names strictly in wire order: `toolNames.set` runs when
+    // a `tool_use` block is emitted, and a `tool_result` can only read names
+    // already seen at its position. Never pre-scan future calls.
+    let mut names: HashMap<Option<String>, Option<Arc<str>>> = HashMap::new();
     let mut cluster = ClusterCounter::default();
     let mut sidecar = Sidecar::default();
     let mut out = Vec::new();
@@ -198,43 +357,59 @@ pub fn to_core(body: &Value) -> Converted {
                     out.push(KMessage::new(id, core_role, KContent::Text(text.into())));
                 }
                 "tool_use" => {
-                    let name = block
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let call_id = block
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    // Missing/null stays `None`; `""` stays `Some("")` for both
+                    // name and id. Node's tool-name map keys `undefined`, null
+                    // and `""` separately, so an absent id must never be
+                    // rewritten to `""`.
+                    let name = block.get("name").and_then(Value::as_str);
+                    let call_id = block.get("id").and_then(Value::as_str).map(str::to_string);
                     let arguments = stringify_input(block.get("input").unwrap_or(&json!({})));
                     let id = cluster.next(&derive_id(
                         "assistant",
                         "tool-call",
-                        &name,
+                        name.unwrap_or(""),
                         &arguments,
                         None,
                     ));
                     if let Some(mark) = block.get("cache_control") {
                         sidecar.cache_controls.insert(id.clone(), mark.clone());
                     }
-                    out.push(KMessage::tool_call(id, name, call_id, arguments));
+                    out.push(KMessage::tool_call(
+                        id,
+                        name.unwrap_or(""),
+                        call_id.clone().unwrap_or_default(),
+                        arguments,
+                    ));
+                    // Node writes the map entry only after the call block has
+                    // been converted; later results in the same wire order see
+                    // it, earlier ones do not.
+                    names.insert(call_id, name.map(Arc::from));
                 }
                 "tool_result" => {
                     let call_id = block
                         .get("tool_use_id")
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = names.get(&call_id).cloned().unwrap_or_default();
-                    let text = block_text(
+                        .map(str::to_string);
+                    // Node treats a falsy name on a result as absent, so an
+                    // empty name from the call map becomes `None` here.
+                    let name = names
+                        .get(&call_id)
+                        .cloned()
+                        .flatten()
+                        .filter(|name| !name.is_empty());
+                    let text = result_text(
                         &block
                             .get("content")
                             .cloned()
                             .unwrap_or(Value::String(String::new())),
                     );
-                    let id = cluster.next(&derive_id("tool", "tool-result", &name, &text, None));
+                    let id = cluster.next(&derive_id(
+                        "tool",
+                        "tool-result",
+                        name.as_deref().unwrap_or(""),
+                        &text,
+                        None,
+                    ));
                     if let Some(mark) = block.get("cache_control") {
                         sidecar.cache_controls.insert(id.clone(), mark.clone());
                     }
@@ -244,7 +419,12 @@ pub fn to_core(body: &Value) -> Converted {
                     if content_has_non_text(&block.get("content").cloned().unwrap_or(Value::Null)) {
                         sidecar.raw_blocks.insert(id.clone(), block.clone());
                     }
-                    out.push(KMessage::tool_result(id, name, call_id, text));
+                    out.push(KMessage::tool_result(
+                        id,
+                        name.as_deref().unwrap_or(""),
+                        call_id.unwrap_or_default(),
+                        text,
+                    ));
                 }
                 "thinking" => {
                     let text = block
@@ -295,7 +475,32 @@ pub fn to_core(body: &Value) -> Converted {
 }
 
 fn core_text(message: &KMessage) -> String {
-    message.content.text().unwrap_or("").to_string()
+    // `text()` deliberately returns only prose, but a tool result's only body
+    // is its content. Using `text()` here would silently send an empty
+    // tool_result whenever the sidecar has no raw block (for example a string
+    // tool result, which `content_has_non_text` does not flag).
+    message.content.body().unwrap_or("").to_string()
+}
+
+fn tool_result_block(
+    call_id: Option<&str>,
+    body: &str,
+    sidecar: &Sidecar,
+    message: &KMessage,
+) -> Value {
+    let mut block = json!({
+        "type":"tool_result",
+        "content": body,
+    });
+    // Node omits `tool_use_id` when the call/result pair had no id; null is a
+    // different wire shape. An explicit empty id is still written as "".
+    if let Some(call_id) = call_id {
+        block["tool_use_id"] = json!(call_id);
+    }
+    if sidecar.tool_errors.get(message.id.as_str()) == Some(&true) {
+        block["is_error"] = json!(true);
+    }
+    block
 }
 
 fn is_directive_only(message: &Value) -> bool {
@@ -463,25 +668,45 @@ pub fn from_core(messages: &[KMessage], sidecar: &Sidecar) -> Vec<Value> {
                 name,
                 call_id,
                 arguments,
-            } => json!({
-                "type":"tool_use",
-                "id": call_id,
-                "name": name,
-                "input": serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({})),
-            }),
+            } => {
+                // Node omits `id` for an absent call id rather than emitting
+                // JSON null; keep that wire distinction.
+                let mut block = json!({
+                    "type":"tool_use",
+                    // Runtime default only: the wire has no way to say "absent"
+                    // here, while the kernel identity keeps `None` as null.
+                    "name": if name.is_empty() { "unknown" } else { name },
+                    "input": serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({})),
+                });
+                if !call_id.is_empty() {
+                    block["id"] = json!(call_id);
+                }
+                block
+            }
             KContent::ToolResult { call_id, .. } => {
+                let body = core_text(message);
+                // Raw blocks are only safe while the kernel body still equals
+                // the original wire text. A pruned tool result has a new stub
+                // body; returning the raw block here would put the original
+                // payload back on the wire and hide the artifact pointer.
                 if let Some(raw) = sidecar.raw_blocks.get(message.id.as_str()) {
-                    raw.clone()
-                } else {
-                    let mut block = json!({
-                        "type":"tool_result",
-                        "tool_use_id": call_id,
-                        "content": core_text(message),
-                    });
-                    if sidecar.tool_errors.get(message.id.as_str()) == Some(&true) {
-                        block["is_error"] = json!(true);
+                    if result_text(raw.get("content").unwrap_or(&Value::Null)) == body {
+                        raw.clone()
+                    } else {
+                        tool_result_block(
+                            Some(&**call_id).filter(|id| !id.is_empty()),
+                            &body,
+                            sidecar,
+                            message,
+                        )
                     }
-                    block
+                } else {
+                    tool_result_block(
+                        Some(&**call_id).filter(|id| !id.is_empty()),
+                        &body,
+                        sidecar,
+                        message,
+                    )
                 }
             }
         };
@@ -511,16 +736,67 @@ pub fn estimate_tokens(text: &str) -> usize {
     cjk + other.div_ceil(4)
 }
 
-/// Estimate the prompt size of a request body's messages plus system text.
-pub fn estimate_body_tokens(body: &Value) -> usize {
+/// Rough size of one Anthropic content block. Tool results and tool inputs are
+/// part of the prompt and must not disappear from the occupancy estimate.
+fn estimate_content_tokens(content: &Value) -> usize {
+    match content {
+        Value::String(text) => estimate_tokens(text),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") | Some("thinking") => block
+                    .get("text")
+                    .or_else(|| block.get("thinking"))
+                    .and_then(Value::as_str)
+                    .map(estimate_tokens)
+                    .unwrap_or(0),
+                Some("tool_result") => match block.get("content") {
+                    Some(Value::String(text)) => estimate_tokens(text),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .map(estimate_tokens)
+                        .sum(),
+                    _ => 0,
+                },
+                Some("tool_use") => block
+                    .get("input")
+                    .and_then(|input| serde_json::to_string(input).ok())
+                    .map(|input| estimate_tokens(&input))
+                    .unwrap_or(0),
+                _ => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// Estimate conversation messages only. System/tools are fixed request
+/// overhead and are reported separately by `estimate_fixed_overhead`.
+pub fn estimate_message_tokens(body: &Value) -> usize {
     let messages = body.get("messages").and_then(Value::as_array);
     let mut total = 0usize;
     if let Some(messages) = messages {
         for message in messages {
-            total += estimate_tokens(&block_text(message.get("content").unwrap_or(&Value::Null)));
+            total += estimate_content_tokens(message.get("content").unwrap_or(&Value::Null));
         }
     }
-    total += estimate_tokens(
+    total
+}
+
+fn estimate_tool_tokens(body: &Value) -> usize {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| serde_json::to_string(tools).ok())
+        .map(|tools| estimate_tokens(&tools))
+        .unwrap_or(0)
+}
+
+/// System prompt + tool definitions + any fixed request metadata. This is not
+/// conversation content and must not be silently mixed into the raw estimate.
+pub fn estimate_fixed_overhead(body: &Value) -> usize {
+    let system = estimate_tokens(
         &body
             .get("system")
             .map(|system| match system {
@@ -530,7 +806,17 @@ pub fn estimate_body_tokens(body: &Value) -> usize {
             })
             .unwrap_or_default(),
     );
-    total
+    system + estimate_tool_tokens(body)
+}
+
+/// Estimate the prompt size of a whole request body, including system and
+/// tool definitions, so the returned value matches the wire's effective view.
+#[allow(
+    dead_code,
+    reason = "kept for callers that need the whole-wire estimate"
+)]
+pub fn estimate_body_tokens(body: &Value) -> usize {
+    estimate_message_tokens(body) + estimate_fixed_overhead(body)
 }
 
 /// Append the kernel nudge to the top-level system prompt as a text block.
@@ -600,13 +886,16 @@ pub fn attach_cache_breakpoint(messages: &mut [Value]) {
     }
 }
 
-/// Append a host-authored instruction to the latest user turn.  Merging into
-/// the pending `tool_result` message keeps a tool round valid: a separate user
-/// message between `tool_use` and its result is rejected by Anthropic.
+/// Append a host-authored instruction as a trailing user turn, matching the
+/// Node proxy's nudge placement (the model reads the compress protocol as the
+/// latest thing the user said, not as a system amendment).
 pub fn inject_user_note(body: &mut Value, note: &str) {
     if note.trim().is_empty() {
         return;
     }
+    // A tool round cannot be interrupted by a fresh `user` message, so merge
+    // into the pending user turn (including its tool_result blocks) instead of
+    // emitting a second consecutive user message.
     if let Some(message) = body
         .get_mut("messages")
         .and_then(Value::as_array_mut)
@@ -640,6 +929,10 @@ pub fn inject_user_note(body: &mut Value, note: &str) {
 }
 
 /// Convenience: set the top-level system field from a string.
+#[allow(
+    dead_code,
+    reason = "convenience helper for callers that build system text"
+)]
 pub fn set_system_text(body: &mut Value, text: &str) {
     body["system"] = json!([{"type":"text","text":text}]);
 }
@@ -675,11 +968,16 @@ pub fn inject_standing_instructions(body: &mut Value) {
 }
 
 /// Keep the body's map type accessible to callers that need to build tool defs.
+#[allow(dead_code, reason = "small value helper for tool-definition builders")]
 pub fn empty_object() -> Value {
     Value::Object(Map::new())
 }
 
 /// Re-exported for tests that build messages directly.
+#[allow(
+    dead_code,
+    reason = "test and integration helper for direct kernel messages"
+)]
 pub fn text_message(id: &str, role: Role, text: &str) -> KMessage {
     KMessage::new(id, role, KContent::Text(Arc::from(text)))
 }
@@ -687,6 +985,291 @@ pub fn text_message(id: &str, role: Role, text: &str) -> KMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::ArtifactStore;
+    use crate::prune::{PrunePolicy, prune_tool_results};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// C2-B: upstream's kernel identity cannot represent a missing name, so an
+    /// absent `name` normalizes to the empty string, while the wire rebuild
+    /// (which needs a non-empty name) uses the runtime `"unknown"` default.
+    #[test]
+    fn absent_tool_name_is_normalized_and_unknown_on_rebuild() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","input":{"q":1}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let call = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolCall { .. }))
+            .expect("tool call");
+        assert_eq!(call.content.tool_name(), Some(""));
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let block = rebuilt
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool_use block");
+        assert_eq!(block["name"], "unknown");
+    }
+
+    /// An explicit empty name survives the kernel identity as `""`, but a wire
+    /// rebuild has to produce a usable tool name and normalizes it to `"unknown"`.
+    #[test]
+    fn empty_tool_name_becomes_unknown_on_rebuild() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"","input":{}}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let call = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolCall { .. }))
+            .expect("tool call");
+        assert_eq!(call.content.tool_name(), Some(""));
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let block = rebuilt
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool_use block");
+        assert_eq!(block["name"], "unknown");
+    }
+
+    fn tool_names_in_order(converted: &Converted) -> Vec<Option<&str>> {
+        converted
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                KContent::ToolCall { name, .. } | KContent::ToolResult { name, .. } => {
+                    Some(Some(&**name))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Node learns names in wire order: a result before its call sees no name.
+    #[test]
+    fn result_before_call_does_not_see_later_name() {
+        let body = json!({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some(""), Some("Read")]
+        );
+
+        // Reloading the rebuilt wire must preserve the same order.
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let round = to_core(&json!({"messages": rebuilt})).expect("valid rebuilt fixture");
+        assert_eq!(tool_names_in_order(&round), vec![Some(""), Some("Read")]);
+    }
+
+    /// m1: upstream normalizes an absent call id to `""`; because the empty id
+    /// cannot be distinguished from an explicit one, the rebuild must treat both
+    /// as the same empty key rather than inventing a name.
+    #[test]
+    fn missing_call_id_is_not_rewritten_to_empty() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"noid","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":"r"}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let (call_id, call_name) = converted
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                KContent::ToolCall { call_id, name, .. } => Some((call_id.clone(), name.clone())),
+                _ => None,
+            })
+            .expect("tool call");
+        assert!(call_id.is_empty());
+        assert_eq!(&*call_name, "noid");
+
+        let (result_id, result_name) = converted
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                KContent::ToolResult { call_id, name, .. } => Some((call_id.clone(), name.clone())),
+                _ => None,
+            })
+            .expect("tool result");
+        assert!(result_id.is_empty());
+        assert!(result_name.is_empty());
+
+        // Persistence normalizes an absent id to the empty string.
+        let round: Vec<KMessage> = converted
+            .messages
+            .iter()
+            .map(|message| serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap())
+            .collect();
+        let persisted_call = match &round[0].content {
+            KContent::ToolCall { call_id, .. } => call_id.clone(),
+            _ => unreachable!(),
+        };
+        let persisted_result = match &round[1].content {
+            KContent::ToolResult { call_id, .. } => call_id.clone(),
+            _ => unreachable!(),
+        };
+        assert!(persisted_call.is_empty());
+        assert!(persisted_result.is_empty());
+
+        // Upstream flattens absence and an explicit empty id into `""`, so the
+        // rebuild must not rely on the original distinction.
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let blocks: Vec<&Value> = rebuilt
+            .iter()
+            .flat_map(|message| {
+                message["content"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            })
+            .collect();
+        let wire_call = blocks.iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert!(wire_call.get("id").is_none());
+        let wire_result = blocks.iter().find(|b| b["type"] == "tool_result").unwrap();
+        assert!(wire_result.get("tool_use_id").is_none());
+    }
+
+    /// A result after its call sees the name learned earlier in the stream.
+    #[test]
+    fn result_after_call_learns_name() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some("Read"), Some("Read")]
+        );
+    }
+
+    /// A duplicate call id overwrites the table; each result sees the latest
+    /// call emitted before it, not the last call in the whole request.
+    #[test]
+    fn duplicate_call_id_uses_latest_preceding_name() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"First","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"one"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Second","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"two"}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some("First"), Some("First"), Some("Second"), Some("Second")]
+        );
+    }
+
+    /// Empty and absent call names normalize to the same empty identity, and the
+    /// result side does not invent a real name for either.
+    #[test]
+    fn empty_and_absent_call_names_are_not_result_names() {
+        let body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t2","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"out"}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some(""), Some(""), Some(""), Some("")]
+        );
+    }
+
+    /// Node stringifies an integral float without `.0` and uses a signed
+    /// positive exponent for `>= 1e21`.
+    #[test]
+    fn tool_result_text_float_numbers_use_js_format() {
+        let body = json!({"messages":[{"role":"user","content":[{
+        "type":"tool_result","tool_use_id":"t1","content":[
+            {"type":"text","text":5.0},
+            {"type":"text","text":1e-7},
+            {"type":"text","text":1e21},
+            {"type":"text","text":9007199254740993i64}
+        ]}]}]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "5\n1e-7\n1e+21\n9007199254740992");
+    }
+
+    /// C-1: Node keeps one slot per tool-result content block, so an image
+    /// between two text blocks leaves two newlines. The raw block must also
+    /// survive from_core once the projected text matches the corpus body.
+    #[test]
+    fn tool_result_text_preserves_non_text_slots() {
+        let body = json!({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"a"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"eA=="}},
+                {"type":"text","text":"b"}
+            ]}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "a\n\nb");
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let block = rebuilt
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .find(|block| block["type"] == "tool_result")
+            .expect("tool_result block");
+        assert_eq!(block["content"][1]["type"], "image");
+        assert_eq!(block["content"][1]["source"]["data"], "eA==");
+    }
+
+    /// The JavaScript join boundary: absent/null text is an empty slot,
+    /// numbers and booleans are stringified, and non-text blocks stay empty.
+    #[test]
+    fn tool_result_text_stringifies_scalar_text_and_keeps_slots() {
+        let body = json!({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text"},
+                {"type":"text","text":null},
+                {"type":"text","text":5},
+                {"type":"text","text":true},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"eA=="}}
+            ]}]}
+        ]});
+        let converted = to_core(&body).expect("valid test fixture");
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "\n\n5\ntrue\n");
+    }
 
     fn body() -> Value {
         json!({
@@ -708,10 +1291,29 @@ mod tests {
         })
     }
 
+    fn temp_store(tag: &str) -> (ArtifactStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "bili-anthropic-{tag}-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ));
+        (ArtifactStore::new(&dir), dir)
+    }
+
+    fn stub_artifact_id(stub: &str) -> String {
+        stub.strip_prefix("[artifact ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("artifact stub")
+            .to_string()
+    }
+
     #[test]
     fn round_trip_keeps_bytes_and_ids() {
         let original = body();
-        let converted = to_core(&original);
+        let converted = to_core(&original).expect("valid test fixture");
         let rebuilt = from_core(&converted.messages, &converted.sidecar);
         assert_eq!(rebuilt[0]["role"], "user");
         assert_eq!(rebuilt[0]["content"][0]["text"], "hello");
@@ -737,7 +1339,7 @@ mod tests {
             1,
             json!({"role":"system","content":[{"type":"text","text":"rule"}]}),
         );
-        let converted = to_core(&original);
+        let converted = to_core(&original).expect("valid test fixture");
         let rebuilt = from_core(&converted.messages, &converted.sidecar);
         assert_eq!(rebuilt[1]["role"], "system");
         assert_eq!(rebuilt[1]["content"][0]["text"], "rule");
@@ -750,7 +1352,7 @@ mod tests {
             0,
             json!({"role":"system","content":[{"type":"text","text":"be brief"}]}),
         );
-        let converted = to_core(&request);
+        let converted = to_core(&request).expect("valid test fixture");
         let rebuilt = from_core(&converted.messages, &converted.sidecar);
         assert_eq!(rebuilt[0]["role"], "user");
         assert_eq!(rebuilt[0]["content"][0]["text"], "be brief");
@@ -764,6 +1366,86 @@ mod tests {
     }
 
     #[test]
+    fn estimates_each_prompt_content_shape() {
+        let text =
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hello world"}]}]});
+        assert!(estimate_body_tokens(&text) > 0);
+
+        let tool_result = json!({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"TOOL-RESULT-BODY"}]}
+        ]});
+        assert!(estimate_body_tokens(&tool_result) > 0);
+
+        let tool_use = json!({"messages":[
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"Read","input":{"path":"src/main.rs","nested":{"a":[1,2,3]}}}
+            ]}
+        ]});
+        assert!(estimate_body_tokens(&tool_use) > 0);
+
+        let multiple = json!({"messages":[
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"first"},
+                {"type":"tool_result","tool_use_id":"t2","content":"second"}
+            ]}
+        ]});
+        let one = estimate_body_tokens(&json!({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"first"}]}
+        ]}));
+        assert!(estimate_body_tokens(&multiple) > one);
+
+        let mixed = json!({"messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"please read"},
+                {"type":"tool_result","tool_use_id":"t1","content":"mixed body"}
+            ]}
+        ]});
+        assert!(estimate_body_tokens(&mixed) > 0);
+
+        let empty = json!({"messages":[{"role":"user","content":[]}]});
+        assert_eq!(estimate_body_tokens(&empty), 0);
+
+        let large_nested = json!({"messages":[
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"Write","input":{
+                    "payload": {"level1":{"level2":{"level3":["x".repeat(10_000)]}}}
+                }}
+            ]}
+        ]});
+        assert!(estimate_body_tokens(&large_nested) > 2_000);
+    }
+
+    #[test]
+    fn estimate_includes_system_and_tools_but_reports_them_separately() {
+        let request = json!({
+            "system":[{"type":"text","text":"system instructions"}],
+            "tools":[{"name":"Read","description":"read","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+        });
+        assert!(estimate_fixed_overhead(&request) > 0);
+        assert!(estimate_message_tokens(&request) > 0);
+        assert_eq!(
+            estimate_body_tokens(&request),
+            estimate_message_tokens(&request) + estimate_fixed_overhead(&request)
+        );
+    }
+
+    #[test]
+    fn fixed_wire_fixture_preserves_tool_result_and_estimates_it() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/anthropic-tool-result.json"))
+                .expect("fixture json");
+        let converted = to_core(&fixture).expect("valid test fixture");
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let rebuilt_body =
+            json!({"system": fixture["system"], "tools": fixture["tools"], "messages": rebuilt});
+        assert!(rebuilt_body.to_string().contains("FIXTURE-MID"));
+        assert!(estimate_body_tokens(&rebuilt_body) > 0);
+        assert!(estimate_message_tokens(&rebuilt_body) > 0);
+        assert!(estimate_fixed_overhead(&rebuilt_body) > 0);
+    }
+
+    #[test]
     fn injects_tools_without_duplicating_owned_names() {
         let mut request = json!({"tools":[{"name":"Bash","description":"run"}]});
         inject_tools(&mut request, &billion_context_tool::definitions());
@@ -772,6 +1454,231 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "acp_compress"));
         let count = tools.iter().filter(|tool| tool["name"] == "Bash").count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pruned_tool_result_rebuilds_artifact_stub_and_allows_recovery() {
+        let (store, dir) = temp_store("stub");
+        let raw = format!(
+            "{}ANTHROPIC-MIDDLE-SECRET{}",
+            "ANTHROPIC-HEAD ".repeat(2_000),
+            "ANTHROPIC-TAIL ".repeat(2_000)
+        );
+        let request = json!({"messages":[
+            {"role":"user","content":[{"type":"text","text":"read"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content": raw.clone()}
+            ]}
+        ]});
+        let mut converted = to_core(&request).expect("valid test fixture");
+        let policy = PrunePolicy {
+            enabled: true,
+            min_tokens: 1,
+            ..PrunePolicy::default()
+        };
+        let report = prune_tool_results(
+            &mut converted.messages,
+            20_000,
+            20_000,
+            &HashSet::new(),
+            0,
+            0,
+            Some(&store),
+            &policy,
+            "anthropic-test",
+        );
+        assert_eq!(report.pruned_items, 1);
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let block = rebuilt
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flat_map(|blocks| blocks.iter())
+            .find(|block| block.get("type") == Some(&json!("tool_result")))
+            .expect("tool_result block");
+        let stub = block["content"].as_str().expect("stub string");
+        assert!(stub.starts_with("[artifact "), "{stub}");
+        let artifact_id = stub_artifact_id(stub);
+        assert!(stub.contains(&artifact_id));
+        assert!(
+            !serde_json::to_string(&rebuilt)
+                .unwrap()
+                .contains("ANTHROPIC-MIDDLE-SECRET")
+        );
+
+        let recovered = store.read(&artifact_id, 0, raw.len() as u64).unwrap();
+        assert_eq!(recovered.text, raw);
+        assert_eq!(recovered.byte_len, raw.len() as u64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changed_tool_result_ignores_stale_raw_block() {
+        let request = json!({"messages":[
+            {"role":"user","content":[{"type":"text","text":"read"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":"STALE-RAW-BODY"}
+            ]}
+        ]});
+        let mut converted = to_core(&request).expect("valid test fixture");
+        let index = converted
+            .messages
+            .iter()
+            .position(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result core");
+        let id = converted.messages[index].id.clone();
+        converted.sidecar.raw_blocks.insert(
+            id.as_str().to_string(),
+            json!({
+                "type":"tool_result",
+                "tool_use_id":"toolu_1",
+                "content":"STALE-RAW-BODY"
+            }),
+        );
+        converted
+            .sidecar
+            .tool_errors
+            .insert(id.as_str().to_string(), true);
+        let stub = "[artifact a_deadbeef source m00002]";
+        converted.messages[index] = KMessage::tool_result(id.as_str(), "Read", "toolu_1", stub);
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let block = rebuilt
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flat_map(|blocks| blocks.iter())
+            .find(|block| block.get("type") == Some(&json!("tool_result")))
+            .expect("tool_result block");
+        assert_eq!(block["content"], json!(stub));
+        assert_eq!(block["is_error"], json!(true));
+        assert!(
+            !serde_json::to_string(&rebuilt)
+                .unwrap()
+                .contains("STALE-RAW-BODY")
+        );
+    }
+
+    #[test]
+    fn tool_result_non_string_content_is_rejected_like_node() {
+        let cases = [
+            (
+                json!({"messages":[{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"obj_call","content":{"a":1}}
+                ]}]}),
+                "TypeError: b2.content.map is not a function",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"null_call","content":null}
+                ]}]}),
+                "TypeError: Cannot read properties of null (reading 'map')",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"num_call","content":5}
+                ]}]}),
+                "TypeError: b2.content.map is not a function",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"bool_call","content":true}
+                ]}]}),
+                "TypeError: b2.content.map is not a function",
+            ),
+        ];
+        for (body, expected) in cases {
+            let error = match to_core(&body) {
+                Ok(_) => panic!("expected a conversion error"),
+                Err(error) => error.to_string(),
+            };
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn tool_result_missing_or_null_element_content_is_rejected() {
+        let missing = json!({"messages":[{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"missing_call"}
+        ]}]});
+        let error = match to_core(&missing) {
+            Ok(_) => panic!("expected a conversion error"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error,
+            "TypeError: Cannot read properties of undefined (reading 'map')"
+        );
+
+        let null_element = json!({"messages":[{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"null_element_call","content":[null]}
+        ]}]});
+        let error = match to_core(&null_element) {
+            Ok(_) => panic!("expected a conversion error"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error,
+            "TypeError: Cannot read properties of null (reading 'type')"
+        );
+    }
+
+    #[test]
+    fn top_level_content_shape_is_rejected_like_node() {
+        let cases = [
+            (
+                json!({"messages":[{"role":"user"}]}),
+                "TypeError: blocks is not iterable",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":null}]}),
+                "TypeError: blocks is not iterable",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":5}]}),
+                "TypeError: blocks is not iterable",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[null]}]}),
+                "TypeError: Cannot read properties of null (reading 'type')",
+            ),
+        ];
+        for (body, expected) in cases {
+            let error = match to_core(&body) {
+                Ok(_) => panic!("expected a conversion error"),
+                Err(error) => error.to_string(),
+            };
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn non_null_primitive_tool_result_blocks_are_still_accepted() {
+        for content in [
+            json!([5]),
+            json!([true]),
+            json!([{}]),
+            json!([{"type":"image"}]),
+        ] {
+            let body = json!({"messages":[{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":content}
+            ]}]});
+            let converted = to_core(&body).expect("boundary content is accepted");
+            assert_eq!(converted.messages.len(), 1);
+            assert_eq!(converted.messages[0].content.body(), Some(""));
+        }
+
+        let body = json!({"messages":[{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":5}
+            ]}
+        ]}]});
+        let converted = to_core(&body).expect("scalar text is accepted");
+        assert_eq!(converted.messages[0].content.body(), Some("5"));
     }
 }
 

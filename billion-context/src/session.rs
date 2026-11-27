@@ -370,6 +370,28 @@ impl Session {
     /// Apply the model's compress request. Per-range outcomes, never all-or-
     /// nothing: one stale ref must not throw away nine good ranges.
     pub fn apply_compression(&mut self, req: CompressRequest) -> Applied {
+        self.apply_compression_inner(req)
+    }
+
+    /// Apply the model's compress request with a one-call summary ceiling.
+    ///
+    /// `summaryMaxChars` is a host-level escape hatch for a summary the configured
+    /// ceiling is too small for. Raising the ceiling only for this call keeps the
+    /// default (and every later call) strict, so one accepted over-long summary
+    /// cannot silently widen the budget of the whole session.
+    pub fn apply_compression_with_summary_limit(
+        &mut self,
+        req: CompressRequest,
+        max_summary_length: usize,
+    ) -> Applied {
+        let previous = self.config.compress.max_summary_length;
+        self.config.compress.max_summary_length = max_summary_length;
+        let applied = self.apply_compression_inner(req);
+        self.config.compress.max_summary_length = previous;
+        applied
+    }
+
+    fn apply_compression_inner(&mut self, req: CompressRequest) -> Applied {
         let mut blocks = Vec::new();
         let mut errors = Vec::new();
         let mut tokens_compressed = 0u32;
@@ -1359,6 +1381,39 @@ mod tests {
         assert!(s.apply_compression(make(1, 3)).is_ok());
         let again = s.apply_compression(make(2, 4));
         assert_eq!(again.errors[0].kind, RangeErrorKind::Consumed);
+    }
+
+    #[test]
+    fn a_per_call_summary_ceiling_is_restored_after_one_apply() {
+        let mut config = Config::new(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        config.compress.max_summary_length = 32;
+        let mut session = Session::new(config).with_estimator(CharsAsTokens);
+        let messages = conversation(6, 2_000);
+        let _ = session.process_turn(TurnInput {
+            messages: &messages,
+            token_count: 500,
+            render: RenderStrategy::None,
+            now: 1,
+        });
+
+        let request = CompressRequest {
+            call_id: None,
+            ranges: vec![RequestedRange {
+                start: Boundary::Message(MsgRef::new(1).unwrap()),
+                end: Boundary::Message(MsgRef::new(3).unwrap()),
+                topic: Some("the parser".into()),
+                summary: "x".repeat(200),
+            }],
+            now: 2,
+        };
+        let rejected = session.apply_compression(request.clone());
+        assert_eq!(rejected.errors[0].kind, RangeErrorKind::SummaryTooLong);
+
+        let applied = session.apply_compression_with_summary_limit(request, 512);
+        assert!(applied.is_ok(), "{:?}", applied.errors);
+        assert_eq!(session.config().compress.max_summary_length, 32);
     }
 
     #[test]

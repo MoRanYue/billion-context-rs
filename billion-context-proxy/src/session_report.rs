@@ -54,10 +54,7 @@ fn markdown_report(status: &Value, session_id: &str) -> Response {
         .get("contextLimit")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let pct = context
-        .checked_mul(100)
-        .and_then(|value| value.checked_div(limit))
-        .unwrap_or(0);
+    let pct = context.saturating_mul(100).checked_div(limit).unwrap_or(0);
     let mut lines = vec![
         "# billion-context session report".to_string(),
         String::new(),
