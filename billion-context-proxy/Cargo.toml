@@ -27,7 +27,6 @@ percent-encoding = "2"
 sha2 = "0.10"
 hex = "0.4"
 billion-context = { path = "../billion-context", features = ["serde"] }
-billion-context-wire = { path = "../billion-context-wire" }
 billion-context-tool = { path = "../billion-context-tool" }
 
 [target.'cfg(windows)'.dependencies]

@@ -36,6 +36,7 @@
 //! stricter (it drops the range instead); the difference is documented in
 //! `docs/bili-rust-compaction-plan.md` §2.8.
 
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -61,6 +62,11 @@ const DEFAULT_MAX_INPUT_CHARS: usize = 48_000;
 /// A summary shorter than this is treated as a failed dispatch rather than a
 /// fold with an empty block.
 const MIN_SUMMARY_CHARS: usize = 8;
+
+/// Hard cap on one provider response. A summary is bounded by the session
+/// budget, so anything larger is a broken or hostile endpoint; reject it
+/// instead of buffering without limit.
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 const DEFAULT_OUTPUT_TOKENS: u64 = 8_192;
@@ -456,7 +462,11 @@ pub async fn summarize(external: &ExternalSummary, inputs: &[RangeInput]) -> Opt
         return None;
     }
     let per_target = Duration::from_millis(external.settings.target_timeout_ms.max(1_000));
-    let client = match reqwest::Client::builder().timeout(per_target).build() {
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(per_target)
+        .build()
+    {
         Ok(client) => client,
         Err(err) => {
             log_warn(&format!("compress.externalSummary: no HTTP client: {err}"));
@@ -579,10 +589,13 @@ async fn dispatch(
     }
     let response = request.send().await.map_err(|err| err.to_string())?;
     let status = response.status();
-    let text = response.text().await.map_err(|err| err.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", clip(&text, 200)));
+        // Never echo the provider body: a hostile endpoint can reflect request
+        // headers (including Authorization) into its error text, and the error
+        // string is logged.
+        return Err(format!("HTTP {status}"));
     }
+    let text = read_capped_response(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
     if target.knobs.stream {
         return stream_summary(&text).map(|text| (text, None));
     }
@@ -591,6 +604,22 @@ async fn dispatch(
     let text =
         completion_text(&parsed).ok_or_else(|| "response carried no assistant text".to_string())?;
     Ok((text, completion_usage(&parsed)))
+}
+
+async fn read_capped_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| err.to_string())?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("provider response exceeded {max_bytes} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|err| format!("provider response is not UTF-8: {err}"))
 }
 
 /// Provider-reported token usage, when the response carries it. Some
@@ -728,17 +757,6 @@ impl CharBoundary for str {
         }
         index
     }
-}
-
-fn clip(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let mut cut = limit;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &text[..cut])
 }
 
 /// The host logs to stderr like the rest of the binary; a dedicated prefix keeps
@@ -946,6 +964,59 @@ mod tests {
         let app = Router::new().route(
             "/chat/completions",
             post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let _guard =
+            CredentialFileGuard::install("ONEAGENT_MODEL_API_KEY", "sk-test-credential-value");
+        let parsed = from_config(&oneagent_config(&format!("http://{address}"))).expect("chain");
+        let inputs = vec![RangeInput {
+            label: "m1–m2".to_string(),
+            topic: None,
+            text: "x".to_string(),
+        }];
+        assert!(summarize(&parsed, &inputs).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        use axum::{Router, http::StatusCode, routing::post};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/elsewhere")],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let _guard =
+            CredentialFileGuard::install("ONEAGENT_MODEL_API_KEY", "sk-test-credential-value");
+        let parsed = from_config(&oneagent_config(&format!("http://{address}"))).expect("chain");
+        let inputs = vec![RangeInput {
+            label: "m1–m2".to_string(),
+            topic: None,
+            text: "x".to_string(),
+        }];
+        assert!(summarize(&parsed, &inputs).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_provider_response_is_refused_without_buffering() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async { "x".repeat(MAX_PROVIDER_RESPONSE_BYTES + 1) }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

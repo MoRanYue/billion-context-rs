@@ -21,7 +21,7 @@ use std::{
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{OriginalUri, Query, Request, State},
+    extract::{ConnectInfo, OriginalUri, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -566,7 +566,7 @@ fn upstream_target_allowed(target: &str, allowlist: &[String], allow_ip: bool) -
     }
     allowlist.iter().any(|entry| {
         if let Some(suffix) = entry.strip_prefix("*.") {
-            host.ends_with(suffix) && host.len() > suffix.len()
+            host.ends_with(&format!(".{suffix}"))
         } else {
             host == entry.as_str()
         }
@@ -580,6 +580,18 @@ fn host_is_loopback(host: &str) -> bool {
             .parse::<IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false)
+}
+
+/// A TCP peer is local when its address is loopback. An IPv4 client accepted
+/// on a dual-stack IPv6 listener arrives as `::ffff:127.0.0.1`, which
+/// `Ipv6Addr::is_loopback` alone does not recognize.
+fn peer_is_loopback(peer: SocketAddr) -> bool {
+    match peer.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 fn host_header_is_loopback(headers: &HeaderMap) -> bool {
@@ -1033,10 +1045,7 @@ async fn dsh_compaction_answer(
     let protocol = dsh_compaction::protocol_of(target)?;
     let parsed = serde_json::from_slice::<Value>(payload).ok();
     let declared = dsh_compaction::declared_compaction_call(headers);
-    let marked = parsed
-        .as_ref()
-        .is_some_and(dsh_compaction::marked_compaction_call)
-        || dsh_compaction::body_looks_like_compaction(payload);
+    let marked = dsh_compaction::body_marks_compaction(parsed.as_ref(), payload);
     if !declared && !marked {
         return None;
     }
@@ -2327,10 +2336,18 @@ async fn update_check_handler() -> Response {
     axum::Json(state).into_response()
 }
 
-/// Guard the admin surface: loopback Host only, loopback/allowlisted browser
-/// origins, and a launcher-provided token for state-changing routes. CORS is
-/// emitted from the same allowlist instead of the previous wildcard.
-async fn admin_guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+/// Guard the admin surface: loopback peer and loopback Host only,
+/// loopback/allowlisted browser origins, and a launcher-provided token for
+/// state-changing routes. CORS is emitted from the same allowlist instead of
+/// the previous wildcard. The peer check matters when the proxy itself is
+/// bound to a non-loopback address: a remote client can otherwise spoof
+/// `Host: 127.0.0.1`.
+async fn admin_guard(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
     if !req.uri().path().starts_with("/__bili") {
         return next.run(req).await;
     }
@@ -2345,7 +2362,13 @@ async fn admin_guard(State(state): State<Arc<AppState>>, req: Request, next: Nex
         .as_deref()
         .map(|value| admin_origin_allowed(value, &state))
         .unwrap_or(true);
-    let mut response = if !host_header_is_loopback(req.headers()) {
+    let mut response = if !peer_is_loopback(peer) {
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": "admin endpoint requires a loopback peer"})),
+        )
+            .into_response()
+    } else if !host_header_is_loopback(req.headers()) {
         (
             StatusCode::FORBIDDEN,
             axum::Json(json!({"ok": false, "error": "admin endpoint requires a loopback Host"})),
@@ -2582,7 +2605,7 @@ async fn main() {
     }
     if opts.allow_remote_bind && !host_is_loopback(&opts.host) {
         eprintln!(
-            "[billion-context-proxy] WARNING: listening on non-loopback {}; admin routes stay loopback-only and upstream targets are allowlisted",
+            "[billion-context-proxy] WARNING: listening on non-loopback {}; admin routes accept loopback peers only and upstream targets are allowlisted",
             opts.host
         );
     }
@@ -2807,9 +2830,12 @@ async fn main() {
             _ = shutdown_rx.changed() => {}
         }
     };
-    if let Err(err) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await
     {
         eprintln!("[billion-context-proxy] serve error: {err}");
     }
@@ -2825,4 +2851,46 @@ async fn main() {
     }
     let _ = std::fs::remove_file(&registry_path);
     eprintln!("[billion-context-proxy] exited");
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_allowlist_requires_a_dot_boundary() {
+        let allowlist = vec!["*.example.com".to_string()];
+        assert!(upstream_target_allowed(
+            "https://api.example.com/v1",
+            &allowlist,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "https://evil-example.com/v1",
+            &allowlist,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "https://example.com/v1",
+            &allowlist,
+            false
+        ));
+    }
+
+    #[test]
+    fn loopback_peers_include_ipv4_mapped_ipv6() {
+        assert!(peer_is_loopback(SocketAddr::from(([127, 0, 0, 1], 7000))));
+        assert!(peer_is_loopback(SocketAddr::from((
+            [0, 0, 0, 0, 0, 0, 0, 1],
+            7000
+        ))));
+        assert!(peer_is_loopback(SocketAddr::from((
+            [0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001],
+            7000
+        ))));
+        assert!(!peer_is_loopback(SocketAddr::from((
+            [192, 168, 15, 201],
+            7000
+        ))));
+    }
 }

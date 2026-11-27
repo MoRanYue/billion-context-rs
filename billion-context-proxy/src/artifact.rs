@@ -44,6 +44,17 @@ fn artifact_id_for(content: &str) -> String {
     format!("a_{}", &sha256[..HASH_PREFIX_CHARS])
 }
 
+/// Content-addressed ids are always `a_` plus a lowercase hex prefix. Validate
+/// before joining a path: a tool-supplied id must never become a path
+/// separator, even for a transient file-existence oracle.
+pub fn is_valid_artifact_id(id: &str) -> bool {
+    id.len() == HASH_PREFIX_CHARS + 2
+        && id.starts_with("a_")
+        && id[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -761,6 +772,9 @@ impl ArtifactStore {
     }
 
     pub fn info(&self, artifact_id: &str) -> Result<ArtifactMetadata, String> {
+        if !is_valid_artifact_id(artifact_id) {
+            return Err("invalid artifact id".to_string());
+        }
         let text = fs::read_to_string(self.meta_path(artifact_id))
             .map_err(|e| format!("artifact {artifact_id} metadata: {e}"))?;
         serde_json::from_str(&text).map_err(|e| format!("artifact {artifact_id} metadata: {e}"))
@@ -1224,6 +1238,27 @@ mod tests {
         hasher.update(content.as_bytes());
         let sha256 = hex::encode(hasher.finalize());
         format!("a_{}", &sha256[..HASH_PREFIX_CHARS])
+    }
+
+    #[test]
+    fn metadata_lookup_rejects_ids_that_are_not_content_addressed() {
+        let (store, root) = temp_store();
+        let outside = root
+            .parent()
+            .unwrap_or(&root)
+            .join("bili-artifact-oracle.json");
+        fs::write(&outside, r#"{"artifact_id":"a_outside"}"#).expect("write outside");
+        for id in [
+            "../../../bili-artifact-oracle",
+            "a_/../../x",
+            "a_",
+            "a_zzzz",
+        ] {
+            assert!(store.info(id).is_err(), "{id} must be refused");
+        }
+        let missing = artifact_id_for("never stored");
+        assert!(store.info(&missing).is_err());
+        let _ = fs::remove_file(outside);
     }
 
     #[test]

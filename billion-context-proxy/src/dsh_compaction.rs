@@ -139,6 +139,14 @@ pub fn marked_compaction_call(body: &Value) -> bool {
     })
 }
 
+/// Decisive marker check. Once the body parses, only the final user turn may
+/// mark a call; the byte sniff is a pre-parse fallback, never an alternative.
+/// A conversation that merely quotes the instruction elsewhere must not
+/// false-positive (Node: `dsh-compaction-guard.ts`).
+pub fn body_marks_compaction(parsed: Option<&Value>, raw: &[u8]) -> bool {
+    parsed.map_or_else(|| body_looks_like_compaction(raw), marked_compaction_call)
+}
+
 /// Rendered block summary, byte-for-byte the Node shape: the shared header,
 /// an em-dash topic when the block has one, then the summary body.
 pub fn render_forged_summary(topic: Option<&str>, summary: &str) -> String {
@@ -506,6 +514,30 @@ mod tests {
         assert!(!body_looks_like_compaction(
             b"{\"messages\":[{\"role\":\"user\"}]}"
         ));
+    }
+
+    #[test]
+    fn a_parsed_body_uses_only_the_final_user_turn_not_the_byte_sniff() {
+        let prefix = DSH_COMPACTION_INSTRUCTION_PREFIX;
+        let quoted = json!({
+            "messages": [
+                {"role": "user", "content": format!("please explain this instruction: {prefix}")},
+                {"role": "assistant", "content": "reading"},
+            ]
+        });
+        let raw = serde_json::to_vec(&quoted).expect("encode quoted body");
+        assert!(body_looks_like_compaction(&raw));
+        assert!(!body_marks_compaction(Some(&quoted), &raw));
+
+        let actual = json!({
+            "messages": [
+                {"role": "user", "content": format!("  {prefix}\n\nfold it")},
+            ]
+        });
+        assert!(body_marks_compaction(Some(&actual), b""));
+
+        let unparseable = format!("<{prefix}>").into_bytes();
+        assert!(body_marks_compaction(None, &unparseable));
     }
 
     #[test]

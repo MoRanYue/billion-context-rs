@@ -147,7 +147,6 @@ dependencies = [
  "axum",
  "billion-context",
  "billion-context-tool",
- "billion-context-wire",
  "bytes",
  "futures-util",
  "hex",
