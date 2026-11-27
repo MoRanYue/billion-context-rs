@@ -12,9 +12,26 @@ cargo test -p billion-context-proxy
 target\release\billion-context-proxy.exe start --port 18113 --debug
 ```
 
-默认 `127.0.0.1:8765`；`--passthrough` 关闭压缩，`--strict-port` 端口占用时退出。
+默认 `127.0.0.1:18787`；`--passthrough` 关闭压缩，`--strict-port` 端口占用时退出。
 状态目录为 `~/.local/state/billion-context`（可用 `XDG_STATE_HOME` 覆盖），与 Node
 版同级但不读写其数据库。
+
+## 安全边界
+
+- 默认只绑定回环地址；绑定非回环地址必须显式 `--allow-remote-bind`（或
+  `BILI_ALLOW_REMOTE_BIND=1`），启动时会打印警告。
+- `/__bili/*` 管理面要求回环 `Host`；浏览器 `Origin` 只接受回环来源或
+  `BILI_ADMIN_ORIGINS`（逗号分隔），CORS 不再回 `*`。
+- 设置 `BILI_LAUNCH_TOKEN` 时，管理写操作（非 GET/HEAD/OPTIONS）必须携带
+  `x-bili-launch-token` 或 `Authorization: Bearer <token>`；插件工具车道与
+  watcher 心跳豁免，避免压缩调用和生命周期心跳被令牌卡住。Node 启动器会注入
+  该变量，面板或中继需要把令牌转发到宿主。
+- `GET /__bili/config` 会递归脱敏 `apiKey`、`token`、`secret`、`password` 等字段；
+  `PUT` 拒绝任何包含 `***REDACTED***` 的请求（包括 `dsh` 局部合并），避免把脱敏值
+  写回磁盘。改配置请直接编辑配置文件，或重新填写缺失的密钥。
+- `/bili/<absolute-url>` 只允许默认 provider 域名、`BILI_MITM_DOMAINS` 和
+  `BILI_UPSTREAM_ALLOWLIST`；`*.example.com` 表示子域通配。本地 mock 上游需把
+  精确 IP/host 加入 allowlist，或设置 `BILI_ALLOW_PRIVATE_UPSTREAM=1`。
 
 ## 模块
 

@@ -481,7 +481,13 @@ impl Store {
         })
     }
 
-    fn with_entry<T>(&self, key: &str, context_limit: u32, f: impl FnOnce(&mut Entry) -> T) -> T {
+    fn with_entry<T>(
+        &self,
+        key: &str,
+        context_limit: u32,
+        reset_window: bool,
+        f: impl FnOnce(&mut Entry) -> T,
+    ) -> T {
         self.ensure_loaded(key);
         let mut guard = self.inner.lock().expect("session store poisoned");
         let entry = guard.entry(key.to_string()).or_insert_with(|| Entry {
@@ -507,9 +513,10 @@ impl Store {
             upstream: String::new(),
             fold_events: Vec::new(),
         });
-        if entry.context_limit != context_limit {
-            // A resumed conversation can arrive with a different model window;
-            // rebuild rather than run the old window's thresholds forever.
+        if entry.context_limit != context_limit && reset_window {
+            // Only an explicit reset may change a live conversation's window.
+            // A header that merely drifts between requests must not discard
+            // blocks, ranges, the pending nudge, or fold events.
             entry.session = Session::new(Config::new(context_limit))
                 .with_estimator(Self::estimator_for())
                 .with_view_mode(billion_context::ViewMode::Send)
@@ -537,8 +544,23 @@ impl Store {
         token_count: u32,
         model: Option<String>,
     ) -> Prepared {
+        self.prepare_with_reset(key, context_limit, messages, token_count, model, false)
+    }
+
+    /// `reset_window` is an explicit caller decision (the plugin reset header),
+    /// not an inferred model switch: the first window seen for a conversation
+    /// stays authoritative otherwise.
+    pub fn prepare_with_reset(
+        &self,
+        key: &str,
+        context_limit: u32,
+        messages: &[billion_context::Message],
+        token_count: u32,
+        model: Option<String>,
+        reset_window: bool,
+    ) -> Prepared {
         let now = now_ms();
-        self.with_entry(key, context_limit, |entry| {
+        self.with_entry(key, context_limit, reset_window, |entry| {
             let turn = entry.session.process_turn(TurnInput {
                 messages,
                 token_count,
@@ -589,7 +611,7 @@ impl Store {
         args: &Value,
     ) -> (String, Option<&'static str>, Option<u32>) {
         let now = now_ms();
-        self.with_entry(key, context_limit, |entry| match name {
+        self.with_entry(key, context_limit, false, |entry| match name {
             "acp_compress" | "compress" => match tool::parse_compress(&normalize_compress_args(args)) {
                 Ok(ranges) => {
                     let min = entry.session.config().compress.min_compress_range;
@@ -941,21 +963,22 @@ impl Store {
     }
 
     pub fn latest_status_json(&self) -> Option<Value> {
-        let latest_key = self
-            .index
-            .lock()
-            .expect("session store poisoned")
-            .iter()
-            .max_by_key(|(_, meta)| meta.last_seen)
-            .map(|(key, _)| key.clone())
-            .or_else(|| {
-                self.inner
-                    .lock()
-                    .expect("session store poisoned")
-                    .iter()
-                    .max_by_key(|(_, entry)| entry.last_seen)
-                    .map(|(key, _)| key.clone())
-            })?;
+        // Lock order is inner then index everywhere; never hold the index lock
+        // while waiting for inner, or with_entry's persist path deadlocks.
+        let indexed_key = {
+            let index = self.index.lock().expect("session store poisoned");
+            index
+                .iter()
+                .max_by_key(|(_, meta)| meta.last_seen)
+                .map(|(key, _)| key.clone())
+        };
+        let latest_key = indexed_key.or_else(|| {
+            let guard = self.inner.lock().expect("session store poisoned");
+            guard
+                .iter()
+                .max_by_key(|(_, entry)| entry.last_seen)
+                .map(|(key, _)| key.clone())
+        })?;
         self.ensure_loaded(&latest_key);
         let guard = self.inner.lock().expect("session store poisoned");
         let entry = guard.get(&latest_key)?;
@@ -1422,5 +1445,21 @@ mod tests {
             assert_eq!(store.storage_json()["sessions"], 1);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drifting_context_window_does_not_wipe_state() {
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let converted = crate::anthropic::to_core(&body);
+        let store = Store::new();
+        store.prepare("stable-key", 200_000, &converted.messages, 30, None);
+        // A client that changes its advertised window between turns must not
+        // reset the kernel; only the explicit reset entry point may do that.
+        store.prepare("stable-key", 100_000, &converted.messages, 30, None);
+        let status = store.status_json("stable-key").expect("session");
+        assert_eq!(status["contextLimit"], 200_000);
+        store.prepare_with_reset("stable-key", 100_000, &converted.messages, 30, None, true);
+        let status = store.status_json("stable-key").expect("session");
+        assert_eq!(status["contextLimit"], 100_000);
     }
 }

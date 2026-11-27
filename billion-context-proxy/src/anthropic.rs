@@ -600,12 +600,34 @@ pub fn attach_cache_breakpoint(messages: &mut [Value]) {
     }
 }
 
-/// Append a host-authored instruction as a trailing user turn, matching the
-/// Node proxy's nudge placement (the model reads the compress protocol as the
-/// latest thing the user said, not as a system amendment).
+/// Append a host-authored instruction to the latest user turn.  Merging into
+/// the pending `tool_result` message keeps a tool round valid: a separate user
+/// message between `tool_use` and its result is rejected by Anthropic.
 pub fn inject_user_note(body: &mut Value, note: &str) {
     if note.trim().is_empty() {
         return;
+    }
+    if let Some(message) = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    {
+        if message.get("role").and_then(Value::as_str) == Some("user") {
+            let content = message.get("content");
+            if content.is_none() || content.is_some_and(Value::is_null) {
+                message["content"] = json!([{"type": "text", "text": note}]);
+                return;
+            }
+            if let Some(Value::Array(blocks)) = message.get_mut("content") {
+                blocks.push(json!({"type": "text", "text": note}));
+                return;
+            }
+            if let Some(Value::String(text)) = message.get_mut("content") {
+                text.push_str("\n\n");
+                text.push_str(note);
+                return;
+            }
+        }
     }
     let message = json!({
         "role": "user",
@@ -770,5 +792,21 @@ mod inject_tests {
         let mut blocks = json!({"system":[{"type":"text","text":"Base"}],"messages":[]});
         inject_standing_instructions(&mut blocks);
         assert_eq!(blocks["system"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nudge_merges_into_pending_tool_result() {
+        let mut body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+        ]});
+        inject_user_note(&mut body, "compress now");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        let blocks = messages[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "compress now");
     }
 }
