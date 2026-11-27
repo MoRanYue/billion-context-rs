@@ -14,7 +14,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -174,6 +174,17 @@ struct AppState {
     upstream: Mutex<Option<String>>,
     upstream_failures: Mutex<HashMap<String, UpstreamFailure>>,
     sessions: session_store::Store,
+    /// Per-instance token written by the launcher.  Admin mutations require it
+    /// when present; absent means standalone development mode (still guarded by
+    /// the loopback Host and Origin checks).
+    launch_token: Option<String>,
+    /// Exact non-loopback panel origins allowed to call `/__bili/*`.  Loopback
+    /// origins are always accepted so the DSH web view keeps working.
+    admin_origins: Vec<String>,
+    /// Hosts the forward proxy may dial.  Entries support exact names and
+    /// `*.suffix` wildcards; literal IPs are refused unless explicitly allowed.
+    upstream_allowlist: Vec<String>,
+    allow_private_upstreams: bool,
 }
 
 #[derive(Clone)]
@@ -191,6 +202,7 @@ struct Options {
     passthrough: bool,
     debug: bool,
     strict_port: bool,
+    allow_remote_bind: bool,
 }
 
 fn env_u16(name: &str) -> Option<u16> {
@@ -205,7 +217,7 @@ fn opts_from_args() -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "billion-context-proxy {} — usage: billion-context-proxy [start] [--host H] [--port N] [--passthrough] [--debug]",
+            "billion-context-proxy {} — usage: billion-context-proxy [start] [--host H] [--port N] [--passthrough] [--debug] [--allow-remote-bind]",
             VERSION
         );
         std::process::exit(0);
@@ -219,6 +231,7 @@ fn opts_from_args() -> Options {
     let mut passthrough = env_str("BILI_PASSTHROUGH").as_deref() == Some("1");
     let mut debug = env_str("BILI_DEBUG").as_deref() == Some("1");
     let mut strict_port = env_str("BILI_STRICT_PORT").as_deref() == Some("1");
+    let mut allow_remote_bind = env_str("BILI_ALLOW_REMOTE_BIND").as_deref() == Some("1");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -238,6 +251,7 @@ fn opts_from_args() -> Options {
             "--passthrough" => passthrough = true,
             "--debug" => debug = true,
             "--strict-port" => strict_port = true,
+            "--allow-remote-bind" => allow_remote_bind = true,
             other => {
                 // Unknown flags belong to the Node CLI surface we do not emulate
                 // yet; ignore rather than fail so a hand-rolled spawn still boots.
@@ -252,6 +266,7 @@ fn opts_from_args() -> Options {
         passthrough,
         debug,
         strict_port,
+        allow_remote_bind,
     }
 }
 
@@ -415,6 +430,183 @@ fn mitm_domains_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+const DEFAULT_UPSTREAM_HOSTS: &[&str] = &[
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "openrouter.ai",
+    "api.deepseek.com",
+    "api.moonshot.cn",
+    "api.minimax.chat",
+    "api.x.ai",
+    "api.groq.com",
+    "api.mistral.ai",
+    "api.together.xyz",
+    "api.cohere.ai",
+];
+
+fn upstream_allowlist_from_env(mitm_domains: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = DEFAULT_UPSTREAM_HOSTS
+        .iter()
+        .map(|host| host.to_ascii_lowercase())
+        .collect();
+    let mut extras: Vec<String> = mitm_domains.to_vec();
+    if let Some(raw) = env_str("BILI_UPSTREAM_ALLOWLIST") {
+        extras.push(raw);
+    }
+    for extra in &extras {
+        for host in extra.split(',') {
+            let host = host.trim().to_ascii_lowercase();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
+/// Only http(s) targets whose host is explicitly listed may be dialed.  A
+/// literal IP is accepted only when the operator opted in (`BILI_ALLOW_PRIVATE_UPSTREAM=1`)
+/// or wrote that exact IP into the allowlist (local mock upstreams).
+fn upstream_target_allowed(target: &str, allowlist: &[String], allow_ip: bool) -> bool {
+    let Ok(url) = reqwest::Url::parse(target) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok() {
+        return allow_ip || allowlist.iter().any(|entry| entry == &host);
+    }
+    allowlist.iter().any(|entry| {
+        if let Some(suffix) = entry.strip_prefix("*.") {
+            host.ends_with(suffix) && host.len() > suffix.len()
+        } else {
+            host == entry.as_str()
+        }
+    })
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn host_header_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        raw.split(':').next().unwrap_or("")
+    };
+    host_is_loopback(host)
+}
+
+fn origin_host(origin: &str) -> Option<String> {
+    let url = reqwest::Url::parse(origin).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    url.host_str().map(|host| {
+        host.trim_matches(|c| c == '[' || c == ']')
+            .to_ascii_lowercase()
+    })
+}
+
+fn admin_origins_from_env(origin: &str, port: u16) -> Vec<String> {
+    let mut origins = vec![
+        origin.to_string(),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
+    ];
+    if let Some(raw) = env_str("BILI_ADMIN_ORIGINS") {
+        for item in raw.split(',') {
+            let item = item.trim().trim_end_matches('/');
+            if !item.is_empty() && !origins.iter().any(|known| known == item) {
+                origins.push(item.to_string());
+            }
+        }
+    }
+    origins
+}
+
+/// A browser may read `/__bili/*` only from a loopback origin or an explicitly
+/// configured panel origin.  `Origin: null` and public web origins are denied.
+fn admin_origin_allowed(origin: &str, state: &AppState) -> bool {
+    state.admin_origins.iter().any(|allowed| allowed == origin)
+        || origin_host(origin).is_some_and(|host| host_is_loopback(&host))
+}
+
+fn launch_token_ok(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let presented = headers
+        .get("x-bili-launch-token")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        });
+    presented.is_some_and(|token| token == expected)
+}
+
+fn admin_mutation(method: &Method, path: &str) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    // Internal liveness lanes (plugin tools and the owner watcher heartbeat)
+    // are not the browser admin surface; they stay reachable so a session
+    // launched with a token keeps compressing and stays watched.
+    path != "/__bili/plugin/tool" && path != "/__bili/watcher"
+}
+
+fn add_cors_headers(response: &mut Response, origin: Option<&str>) {
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(origin) = origin {
+        if let Ok(value) = HeaderValue::from_str(origin) {
+            response
+                .headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        }
+    }
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(
+            "content-type, authorization, x-bili-launch-token, x-bili-plugin, \
+             x-bili-plugin-conversation, x-bili-plugin-model, \
+             x-bili-plugin-context-window, x-bili-plugin-reset",
+        ),
+    );
+}
+
 /// Bind with the Node ladder: strict-port refuses to drift, otherwise +1 on
 /// EADDRINUSE so a stuck predecessor cannot block a fresh session.
 async fn bind_with_ladder(
@@ -478,6 +670,16 @@ async fn forward_handler(
             "missing absolute upstream URL after /bili/",
         );
     };
+    if !upstream_target_allowed(
+        &target,
+        &state.upstream_allowlist,
+        state.allow_private_upstreams,
+    ) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "upstream target is not in the configured allowlist",
+        );
+    }
     if let Ok(mut upstream) = state.upstream.lock() {
         *upstream = Some(upstream_base(&target));
     }
@@ -643,6 +845,8 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
     let key = conversation_key(headers, &body);
     let context_limit = context_limit(headers);
     let plugin_mode = headers.contains_key("x-bili-plugin");
+    let reset_window =
+        headers.contains_key("x-bili-plugin-reset") || headers.contains_key("x-bili-context-reset");
     let model = headers
         .get("x-bili-plugin-model")
         .and_then(|value| value.to_str().ok())
@@ -656,12 +860,13 @@ fn maybe_prepare(state: &AppState, target: &str, headers: &HeaderMap, payload: B
     if openai_wire {
         let token_count = (openai::estimate_body_tokens(&body) as u32).saturating_add(800);
         let converted = openai::to_core(&body);
-        let prepared = state.sessions.prepare(
+        let prepared = state.sessions.prepare_with_reset(
             &key,
             context_limit,
             &converted.messages,
             token_count,
             model.clone(),
+            reset_window,
         );
         state
             .sessions
@@ -1021,11 +1226,69 @@ async fn pricing_handler(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(value).into_response()
 }
 
+fn config_key_is_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let compact: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    // Match secret-shaped names, not every name containing the substring: `maxTokens`
+    // and `prompt_tokens` are limits/counts, not credentials.
+    let words: Vec<&str> = key
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "secret" | "password" | "authorization" | "credential"
+        )
+    }) || words.last() == Some(&"token")
+        || compact.ends_with("apikey")
+        || compact.ends_with("secret")
+        || compact.ends_with("password")
+        || compact.ends_with("token")
+        || compact.ends_with("authorization")
+        || compact.ends_with("credential")
+        || compact.contains("secretkey")
+        || compact.contains("passwordhash")
+}
+
+/// Replace every credential-looking value before the admin view serializes it.
+/// The config file itself is never rewritten here; saving a redacted document
+/// is refused by `config_put_handler` so an edit cannot silently erase secrets.
+fn redact_config(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = false;
+            for (key, child) in map.iter_mut() {
+                if config_key_is_secret(key) && !child.is_null() {
+                    *child = Value::String("***REDACTED***".to_string());
+                    redacted = true;
+                } else {
+                    redacted |= redact_config(child);
+                }
+            }
+            redacted
+        }
+        Value::Array(items) => {
+            let mut redacted = false;
+            for child in items.iter_mut() {
+                redacted |= redact_config(child);
+            }
+            redacted
+        }
+        _ => false,
+    }
+}
+
 async fn config_get_handler() -> Response {
     let path = config_path();
     let exists = path.exists();
     let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let parsed = serde_json::from_str::<Value>(&raw).ok();
+    let mut parsed = serde_json::from_str::<Value>(&raw).ok();
+    let redacted = parsed.as_mut().is_some_and(redact_config);
+    let redacted_raw = parsed
+        .as_ref()
+        .and_then(|value| serde_json::to_string_pretty(value).ok())
+        .unwrap_or_default();
     let parse_error = if exists && parsed.is_none() {
         Some("config file is not valid JSON".to_string())
     } else {
@@ -1035,8 +1298,11 @@ async fn config_get_handler() -> Response {
         "ok": true,
         "path": path.to_string_lossy(),
         "exists": exists,
-        "raw": raw,
+        // Never hand the unredacted file to an admin reader: a browser page
+        // could otherwise exfiltrate provider keys just by fetching this route.
+        "raw": redacted_raw,
         "parsed": parsed,
+        "redacted": redacted,
         "parseError": parse_error,
     }))
     .into_response()
@@ -1065,11 +1331,23 @@ async fn config_put_handler(body: Body) -> Response {
     if !request.is_object() {
         return error_response(StatusCode::BAD_REQUEST, "expected JSON object");
     }
+    if request.to_string().contains("***REDACTED***") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "refusing to save a redacted config; edit the file on disk or re-enter the missing secrets",
+        );
+    }
     let path = config_path();
     let next = if let Some(file) = request.get("file") {
         let Some(file) = file.as_str() else {
             return error_response(StatusCode::BAD_REQUEST, "file must be a JSON string");
         };
+        if file.contains("***REDACTED***") {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "refusing to save a redacted config; edit the file on disk or re-enter the missing secrets",
+            );
+        }
         match serde_json::from_str::<Value>(file) {
             Ok(value) if value.is_object() => value,
             Ok(_) => {
@@ -1155,36 +1433,58 @@ async fn update_check_handler() -> Response {
     axum::Json(state).into_response()
 }
 
-/// The DSH native panel fetches `/__bili/` from the DSH web origin, so every
-/// admin response needs explicit CORS headers even though the proxy itself
-/// usually runs on a loopback origin.
-async fn cors(req: Request, next: Next) -> Response {
-    let admin = req.uri().path().starts_with("/__bili");
-    if admin && req.method() == Method::OPTIONS {
-        let mut response = StatusCode::NO_CONTENT.into_response();
-        add_cors_headers(&mut response);
-        return response;
+/// Guard the admin surface: loopback Host only, loopback/allowlisted browser
+/// origins, and a launcher-provided token for state-changing routes.  CORS is
+/// emitted from the same allowlist instead of the previous wildcard.
+async fn admin_guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if !req.uri().path().starts_with("/__bili") {
+        return next.run(req).await;
     }
-    let mut response = next.run(req).await;
-    if admin {
-        add_cors_headers(&mut response);
-    }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let origin_allowed = origin
+        .as_deref()
+        .map(|value| admin_origin_allowed(value, &state))
+        .unwrap_or(true);
+    let mut response = if !host_header_is_loopback(req.headers()) {
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": "admin endpoint requires a loopback Host"})),
+        )
+            .into_response()
+    } else if origin.is_some() && !origin_allowed {
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": "admin origin is not allowlisted"})),
+        )
+            .into_response()
+    } else if method == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else if admin_mutation(&method, &path)
+        && !launch_token_ok(req.headers(), state.launch_token.as_deref())
+    {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"ok": false, "error": "missing or invalid launch token"})),
+        )
+            .into_response()
+    } else {
+        next.run(req).await
+    };
+    add_cors_headers(
+        &mut response,
+        if origin_allowed {
+            origin.as_deref()
+        } else {
+            None
+        },
+    );
     response
-}
-
-fn add_cors_headers(response: &mut Response) {
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-    );
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("content-type, authorization, x-bili-plugin, x-bili-plugin-conversation, x-bili-plugin-model, x-bili-plugin-context-window"),
-    );
 }
 
 async fn panel_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -1378,6 +1678,19 @@ fn pid_alive(pid: u32) -> bool {
 #[tokio::main]
 async fn main() {
     let opts = opts_from_args();
+    if !opts.allow_remote_bind && !host_is_loopback(&opts.host) {
+        eprintln!(
+            "[billion-context-proxy] refusing non-loopback bind {}; pass --allow-remote-bind or BILI_ALLOW_REMOTE_BIND=1",
+            opts.host
+        );
+        std::process::exit(2);
+    }
+    if opts.allow_remote_bind && !host_is_loopback(&opts.host) {
+        eprintln!(
+            "[billion-context-proxy] WARNING: listening on non-loopback {}; admin routes stay loopback-only and upstream targets are allowlisted",
+            opts.host
+        );
+    }
     let (listener, bound_port) =
         match bind_with_ladder(&opts.host, opts.port, opts.strict_port).await {
             Ok(v) => v,
@@ -1435,7 +1748,16 @@ async fn main() {
         sessions: session_store::Store::with_dir(sessions_dir.join("rust-sessions")),
         upstream: Mutex::new(env_str("BILI_UPSTREAM")),
         upstream_failures: Mutex::new(HashMap::new()),
+        launch_token: launch_token.clone(),
+        admin_origins: admin_origins_from_env(&origin, bound_port),
+        upstream_allowlist: upstream_allowlist_from_env(&mitm_domains),
+        allow_private_upstreams: env_str("BILI_ALLOW_PRIVATE_UPSTREAM").as_deref() == Some("1"),
     });
+    if launch_token.is_none() {
+        eprintln!(
+            "[billion-context-proxy] warning: BILI_LAUNCH_TOKEN is unset; admin mutations are guarded only by loopback Host/Origin"
+        );
+    }
 
     let instance = ProxyInstanceFile {
         origin: origin.clone(),
@@ -1520,7 +1842,7 @@ async fn main() {
         .route("/__bili/", get(panel_handler))
         .route("/__bili", get(panel_handler))
         .route("/__bili/upstreams", get(upstreams_handler))
-        .layer(middleware::from_fn(cors))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_guard))
         .with_state(state.clone());
 
     eprintln!(
@@ -1551,4 +1873,155 @@ async fn main() {
     }
     let _ = std::fs::remove_file(&registry_path);
     eprintln!("[billion-context-proxy] exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> AppState {
+        let (shutdown_tx, _) = watch::channel(false);
+        AppState {
+            client: reqwest::Client::new(),
+            origin: "http://127.0.0.1:18787".into(),
+            host: "127.0.0.1".into(),
+            port: 18787,
+            instance_id: "test".into(),
+            started_at: 0,
+            passthrough: false,
+            debug: false,
+            parent_pid: None,
+            watchers: Mutex::new(HashSet::new()),
+            shutdown_tx,
+            upstream: Mutex::new(None),
+            upstream_failures: Mutex::new(HashMap::new()),
+            sessions: session_store::Store::new(),
+            launch_token: Some("secret".into()),
+            admin_origins: vec!["http://127.0.0.1:18787".into()],
+            upstream_allowlist: vec!["api.openai.com".into(), "*.example.com".into()],
+            allow_private_upstreams: false,
+        }
+    }
+
+    #[test]
+    fn upstream_allowlist_is_exact_or_wildcard() {
+        let allow = vec!["api.openai.com".to_string(), "*.example.com".to_string()];
+        assert!(upstream_target_allowed(
+            "https://api.openai.com/v1/messages",
+            &allow,
+            false
+        ));
+        assert!(upstream_target_allowed(
+            "https://a.example.com/v1",
+            &allow,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "https://example.com/v1",
+            &allow,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "https://api.openai.com.evil.test/v1",
+            &allow,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "http://127.0.0.1:18080/v1",
+            &allow,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "file:///etc/passwd",
+            &allow,
+            false
+        ));
+        assert!(!upstream_target_allowed(
+            "https://user:pass@api.openai.com/v1",
+            &allow,
+            false
+        ));
+    }
+
+    #[test]
+    fn private_upstreams_require_explicit_opt_in() {
+        assert!(upstream_target_allowed(
+            "http://127.0.0.1:18080/v1",
+            &[],
+            true
+        ));
+        assert!(upstream_target_allowed(
+            "http://127.0.0.1:18080/v1",
+            &["127.0.0.1".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn host_and_origin_loopback_detection() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18787"));
+        assert!(host_header_is_loopback(&headers));
+        headers.insert(header::HOST, HeaderValue::from_static("[::1]:18787"));
+        assert!(host_header_is_loopback(&headers));
+        headers.insert(header::HOST, HeaderValue::from_static("evil.test"));
+        assert!(!host_header_is_loopback(&headers));
+        let state = state();
+        assert!(admin_origin_allowed("http://127.0.0.1:54528", &state));
+        assert!(admin_origin_allowed("http://[::1]:54528", &state));
+        assert!(!admin_origin_allowed("http://evil.test", &state));
+        assert!(!admin_origin_allowed("null", &state));
+    }
+
+    #[test]
+    fn launch_token_only_required_for_mutations() {
+        let mut headers = HeaderMap::new();
+        assert!(!launch_token_ok(&headers, Some("secret")));
+        headers.insert("x-bili-launch-token", HeaderValue::from_static("wrong"));
+        assert!(!launch_token_ok(&headers, Some("secret")));
+        headers.insert("x-bili-launch-token", HeaderValue::from_static("secret"));
+        assert!(launch_token_ok(&headers, Some("secret")));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        assert!(launch_token_ok(&headers, Some("secret")));
+        assert!(launch_token_ok(&headers, None));
+        assert!(!admin_mutation(&Method::GET, "/__bili/config"));
+        assert!(admin_mutation(&Method::PUT, "/__bili/config"));
+        assert!(!admin_mutation(&Method::POST, "/__bili/plugin/tool"));
+        assert!(!admin_mutation(&Method::POST, "/__bili/watcher"));
+        assert!(admin_mutation(&Method::POST, "/__bili/shutdown"));
+    }
+
+    #[test]
+    fn config_redaction_hides_credentials_recursively() {
+        let mut config = json!({
+            "providers": {
+                "openai": {"apiKey": "sk-live", "baseURL": "https://api.openai.com"},
+                "anthropic": {"api_key": "sk-ant", "headers": {"Authorization": "Bearer x"}}
+            },
+            "model": "gpt"
+        });
+        assert!(redact_config(&mut config));
+        assert_eq!(config["providers"]["openai"]["apiKey"], "***REDACTED***");
+        assert_eq!(
+            config["providers"]["anthropic"]["api_key"],
+            "***REDACTED***"
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["headers"]["Authorization"],
+            "***REDACTED***"
+        );
+        assert_eq!(config["model"], "gpt");
+        assert!(!config_key_is_secret("baseURL"));
+        assert!(!config_key_is_secret("maxTokens"));
+        assert!(!config_key_is_secret("max_tokens"));
+        assert!(!config_key_is_secret("prompt_tokens"));
+        assert!(!config_key_is_secret("token_count"));
+        assert!(!config_key_is_secret("tokenBudget"));
+        assert!(config_key_is_secret("access_token"));
+        assert!(config_key_is_secret("clientSecret"));
+        assert!(config_key_is_secret("secretKey"));
+    }
 }

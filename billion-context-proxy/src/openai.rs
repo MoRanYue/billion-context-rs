@@ -483,11 +483,35 @@ pub fn from_core(messages: &[KMessage], sidecar: &Sidecar) -> Vec<Value> {
     out
 }
 
-/// Append the kernel nudge as the newest user turn, string content (the shape
-/// an OpenAI-compatible gateway forwards without re-parsing part arrays).
+/// Append the kernel nudge to the newest user turn.  A tool round cannot be
+/// interrupted by a fresh `user` message, so merge into the pending user
+/// content instead of emitting a second consecutive user turn.
 pub fn inject_user_note(body: &mut Value, note: &str) {
     if note.trim().is_empty() {
         return;
+    }
+    if let Some(message) = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    {
+        if message.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(Value::String(text)) = message.get_mut("content") {
+                text.push_str("\n\n");
+                text.push_str(note);
+                return;
+            }
+            if let Some(Value::Array(parts)) = message.get_mut("content") {
+                parts.push(json!({"type": "text", "text": note}));
+                return;
+            }
+            if message.get("content").is_none()
+                || message.get("content").is_some_and(Value::is_null)
+            {
+                message["content"] = Value::String(note.to_string());
+                return;
+            }
+        }
     }
     let message = json!({"role": "user", "content": note});
     match body.get_mut("messages").and_then(Value::as_array_mut) {
@@ -685,5 +709,35 @@ mod inject_tests {
                 .unwrap()
                 .contains("ACP")
         );
+    }
+
+    #[test]
+    fn nudge_merges_into_last_user_turn() {
+        let mut body = json!({"messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_1","content":"ok"},
+            {"role":"user","content":"next"}
+        ]});
+        inject_user_note(&mut body, "compress now");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"].as_str().unwrap(),
+            "next\n\ncompress now"
+        );
+    }
+
+    #[test]
+    fn nudge_appends_text_block_to_multimodal_user_turn() {
+        let mut body = json!({"messages":[
+            {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}
+        ]});
+        inject_user_note(&mut body, "compress now");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][1]["text"], "compress now");
     }
 }

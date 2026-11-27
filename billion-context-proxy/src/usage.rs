@@ -151,19 +151,30 @@ pub fn absorb_json(acc: &mut Accum, text: &str) {
     acc.absorb(&value);
 }
 
-/// Feed complete lines of an SSE stream into the accumulator.
-pub fn absorb_sse_lines(acc: &mut Accum, buffer: &mut String, chunk: &str) {
+/// Feed complete lines of an SSE stream into the accumulator.  Returns true
+/// once a terminal frame (`data: [DONE]` or Anthropic `message_stop`) has been
+/// seen, so the caller can persist billed usage before the client disconnects.
+pub fn absorb_sse_lines(acc: &mut Accum, buffer: &mut String, chunk: &str) -> bool {
+    let mut terminal = false;
     buffer.push_str(chunk);
     while let Some(index) = buffer.find('\n') {
         let line = buffer[..index].trim_end_matches('\r').trim();
         let payload = line.strip_prefix("data:").map(str::trim);
         if let Some(payload) = payload {
-            if payload != "[DONE]" && !payload.is_empty() {
-                absorb_json(acc, payload);
+            if payload == "[DONE]" {
+                terminal = true;
+            } else if !payload.is_empty() {
+                if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    if value.get("type").and_then(Value::as_str) == Some("message_stop") {
+                        terminal = true;
+                    }
+                    acc.absorb(&value);
+                }
             }
         }
         buffer.drain(..=index);
     }
+    terminal
 }
 
 /// Tee an upstream response body through the usage parser.  Bytes are yielded
@@ -184,6 +195,7 @@ where
         let mut acc = Accum::default();
         let mut buffer = String::new();
         let mut body = String::new();
+        let mut recorded = false;
         let sse = content_type.contains("text/event-stream");
         let json = content_type.contains("application/json");
         let mut stream = stream;
@@ -192,18 +204,26 @@ where
             if sse || json {
                 let text = String::from_utf8_lossy(&chunk);
                 if sse {
-                    absorb_sse_lines(&mut acc, &mut buffer, &text);
+                    let terminal = absorb_sse_lines(&mut acc, &mut buffer, &text);
+                    if terminal && !recorded {
+                        if let Some(usage) = acc.finish() {
+                            store.record_usage(&key, fallback_model.as_deref(), usage);
+                        }
+                        recorded = true;
+                    }
                 } else if body.len() < 8 * 1024 * 1024 {
                     body.push_str(&text);
                 }
             }
             yield chunk;
         }
-        if !sse && json && !body.is_empty() {
-            absorb_json(&mut acc, &body);
-        }
-        if let Some(usage) = acc.finish() {
-            store.record_usage(&key, fallback_model.as_deref(), usage);
+        if !recorded {
+            if !sse && json && !body.is_empty() {
+                absorb_json(&mut acc, &body);
+            }
+            if let Some(usage) = acc.finish() {
+                store.record_usage(&key, fallback_model.as_deref(), usage);
+            }
         }
     }
 }
@@ -219,6 +239,40 @@ mod tests {
             absorb_sse_lines(&mut acc, &mut buffer, &format!("{line}\n"));
         }
         acc
+    }
+
+    fn terminal_after(lines: &[&str]) -> bool {
+        let mut acc = Accum::default();
+        let mut buffer = String::new();
+        let mut terminal = false;
+        for line in lines {
+            terminal |= absorb_sse_lines(&mut acc, &mut buffer, &format!("{line}\n"));
+        }
+        terminal
+    }
+
+    #[test]
+    fn openai_done_frame_is_terminal() {
+        assert!(terminal_after(&[
+            r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+            "data: [DONE]",
+        ]));
+    }
+
+    #[test]
+    fn anthropic_message_stop_is_terminal() {
+        assert!(terminal_after(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]));
+    }
+
+    #[test]
+    fn incomplete_sse_is_not_terminal() {
+        assert!(!terminal_after(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":5}}"#,
+        ]));
     }
 
     #[test]
