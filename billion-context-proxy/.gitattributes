@@ -1,0 +1,13 @@
+# 统一按 LF 存储与检出。
+#
+# 本机 core.autocrlf=true 会把检出转成 CRLF，那样「提交后重新 clone」得到的源码
+# 字节与 Phase 4.1 基线记录的 SHA256 不一致，基线就失去可复现性。这里固定 LF，
+# 使 checkout 字节 = 当前工作区字节 = 报告 §1.3 的 SHA256 清单。
+* text=auto eol=lf
+
+# 明确按二进制处理（避免任何换行转换）
+*.exe binary
+*.pdb binary
+*.dll binary
+*.png binary
+*.ico binary

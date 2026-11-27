@@ -1221,6 +1221,13 @@ impl Node for EmergencyTruncate {
                     continue;
                 };
                 let current = io.messages[index].content.body().unwrap_or_default();
+                // A host artifact stub is already a pointer to the bytes a previous
+                // prune moved out of the view. Replaying an older clip over it would
+                // replace the pointer with a staler, less useful excerpt, so the
+                // latch is dropped instead: the stub is the better projection.
+                if current.starts_with(crate::pipeline::ARTIFACT_STUB_PREFIX) {
+                    continue;
+                }
                 if current.len() <= latch.text.len() {
                     // Same or shorter than what we clipped to: nothing to forgive.
                     continue;

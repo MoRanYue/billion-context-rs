@@ -16,6 +16,13 @@ use crate::ids::{MsgRef, Timestamp};
 use crate::message::Message;
 use crate::state::{State, Tier};
 
+/// Prefix of the stand-in a host writes when it moves a payload into an
+/// artifact store. The kernel does not mint these itself, but it must recognise
+/// them: a stub already *is* the projection of the bytes it replaces, so
+/// emergency truncation must never clip it and a stale truncate latch must not
+/// overwrite it with an older, larger excerpt.
+pub const ARTIFACT_STUB_PREFIX: &str = "[artifact ";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RenderStrategy {
     /// Tag every message that has a ref.

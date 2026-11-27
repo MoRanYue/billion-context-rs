@@ -129,6 +129,13 @@ pub fn truncate_large_payloads(
             if text.is_empty() || text.contains(TRUNCATION_MARKER) {
                 continue;
             }
+            // A host artifact stub is already the replacement for a payload that
+            // was moved out of the view. Clipping it would cut the pointer and
+            // the metadata that make the artifact recoverable, without any real
+            // saving: it is the compact projection already.
+            if text.starts_with(crate::pipeline::ARTIFACT_STUB_PREFIX) {
+                continue;
+            }
             // Inline media is never a candidate. Clipping a base64 payload leaves
             // a fragment that decodes to nothing, so the "saving" would destroy the
             // image while keeping the tokens it costs to describe it.
@@ -294,6 +301,25 @@ mod tests {
         );
         let ids: Vec<&str> = out.truncated_ids.iter().map(|i| i.as_str()).collect();
         assert_eq!(ids, vec!["clip"]);
+    }
+
+    #[test]
+    fn an_artifact_stub_is_never_clipped() {
+        let stub = format!(
+            "[artifact a_0123456789abcdef01234567] source m9 (Bash, 99 bytes)\n{}",
+            "x".repeat(100_000)
+        );
+        let messages = vec![Message::tool_result("stub", "Bash", "c", &stub)];
+        let out = truncate_large_payloads(
+            &messages,
+            10_000,
+            &config(),
+            &estimator(),
+            &options(),
+            &never,
+        );
+        assert_eq!(out.truncated_count, 0);
+        assert_eq!(out.messages[0].content.body().unwrap(), stub);
     }
 
     #[test]

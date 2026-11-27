@@ -8,6 +8,7 @@
 //! re-emitted byte-for-byte; only a slot a fold actually rewrote is rebuilt.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use billion_context::{Content as KContent, Message as KMessage, MessageId, Role};
 use serde_json::{Map, Value, json};
@@ -115,7 +116,7 @@ pub struct Sidecar {
     pub slot_ids: HashMap<String, Vec<String>>,
     pub slot_of: HashMap<String, String>,
     pub signatures: HashMap<String, String>,
-    pub tool_names: HashMap<String, String>,
+    pub tool_names: HashMap<Option<String>, Option<Arc<str>>>,
 }
 
 pub struct Converted {
@@ -140,13 +141,63 @@ fn push_core(
     out.push(message);
 }
 
+/// JavaScript `String(value)` for the scalar forms a text part can carry.
+/// Node's join stringifies the `text` value, so JSON `5`/`true` become
+/// `"5"`/`"true"`, while `null` and a missing field become `""`.
+/// `String(number)` formatting for tolerant scalar `text` values; see the
+/// Anthropic side for the exact JavaScript thresholds.
+fn js_number(number: &serde_json::Number) -> String {
+    // JavaScript stores every JSON number as an IEEE-754 double, so a 64-bit
+    // integer literal beyond 2^53 is rounded before `String(...)` runs.
+    let Some(value) = number.as_f64() else {
+        return number.to_string();
+    };
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = value.abs();
+    if (1e-6..1e21).contains(&magnitude) {
+        if value.fract() == 0.0 {
+            return format!("{value:.0}");
+        }
+        return value.to_string();
+    }
+    let rendered = format!("{value:e}");
+    match rendered.split_once('e') {
+        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+            format!("{mantissa}e+{exponent}")
+        }
+        _ => rendered,
+    }
+}
+
+fn js_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => js_number(number),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| js_text(Some(item)))
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(Value::Object(_)) => "[object Object]".to_string(),
+    }
+}
+
 fn text_of(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(|part| match part {
+                Value::String(text) => text.clone(),
+                _ if part.get("type").and_then(Value::as_str) == Some("text") => {
+                    js_text(part.get("text"))
+                }
+                _ => String::new(),
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
@@ -179,14 +230,14 @@ fn signature(message: &KMessage) -> String {
             call_id,
             arguments,
         } => {
-            format!("c:{name}|{call_id}|{arguments}")
+            format!("c:{}|{}|{arguments}", name, call_id)
         }
         KContent::ToolResult {
             name,
             call_id,
             content,
         } => {
-            format!("u:{name}|{call_id}|{content}")
+            format!("u:{}|{}|{content}", name, call_id)
         }
     }
 }
@@ -198,25 +249,6 @@ fn arguments_string(value: &Value) -> String {
     }
 }
 
-fn collect_tool_names(messages: &[Value]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    for message in messages {
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        for call in calls {
-            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
-            let name = call
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            names.insert(id.to_string(), name.to_string());
-        }
-    }
-    names
-}
-
 /// Convert an OpenAI Chat Completions request body into kernel messages.
 pub fn to_core(body: &Value) -> Converted {
     let messages = body
@@ -224,12 +256,13 @@ pub fn to_core(body: &Value) -> Converted {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let tool_names = collect_tool_names(&messages);
+    // Node learns tool names strictly in wire order: `toolNames.set` runs
+    // while the assistant `tool_calls` are emitted, and a `tool` message can
+    // only read names already seen at its position. Never pre-scan future
+    // calls.
+    let mut tool_names: HashMap<Option<String>, Option<Arc<str>>> = HashMap::new();
     let mut cluster = ClusterCounter::default();
-    let mut sidecar = Sidecar {
-        tool_names: tool_names.clone(),
-        ..Sidecar::default()
-    };
+    let mut sidecar = Sidecar::default();
     let mut out: Vec<KMessage> = Vec::new();
 
     for (index, message) in messages.iter().enumerate() {
@@ -246,10 +279,29 @@ pub fn to_core(body: &Value) -> Converted {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let name = tool_names.get(&call_id).cloned().unwrap_or_default();
+            // Node accepts a tool message's own `name` when it is non-empty,
+            // otherwise falls back to the call's name; both falsy mean absent.
+            let direct = message
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(Arc::from);
+            let mapped = tool_names
+                .get(&Some(call_id.clone()))
+                .cloned()
+                .flatten()
+                .filter(|name| !name.is_empty());
+            let name = direct.or(mapped);
             let text = text_of(message.get("content").unwrap_or(&Value::Null));
-            let id_base = derive_id("tool", "tool-result", &name, &text, None);
-            let mut core = KMessage::tool_result(id_base, name, call_id, text);
+            let id_base = derive_id(
+                "tool",
+                "tool-result",
+                name.as_deref().unwrap_or(""),
+                &text,
+                None,
+            );
+            let mut core =
+                KMessage::tool_result(id_base, name.as_deref().unwrap_or(""), call_id, text);
             if !content_is_text_only(message.get("content").unwrap_or(&Value::Null)) {
                 core = core.with_unrecoverable_payload(true);
             }
@@ -327,28 +379,32 @@ pub fn to_core(body: &Value) -> Converted {
             }
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
-                    let call_id = call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let call_id = call.get("id").and_then(Value::as_str).map(str::to_string);
                     let function = call.get("function").cloned().unwrap_or(Value::Null);
-                    let name = function
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let name = function.get("name").and_then(Value::as_str);
                     let arguments =
                         arguments_string(function.get("arguments").unwrap_or(&json!({})));
-                    let id = derive_id("assistant", "tool-call", &name, &arguments, None);
+                    let id = derive_id(
+                        "assistant",
+                        "tool-call",
+                        name.unwrap_or(""),
+                        &arguments,
+                        None,
+                    );
                     push_core(
-                        KMessage::tool_call(id, name, call_id, arguments),
+                        KMessage::tool_call(
+                            id,
+                            name.unwrap_or(""),
+                            call_id.clone().unwrap_or_default(),
+                            arguments,
+                        ),
                         &mut cluster,
                         &mut out,
                         &mut sidecar,
                         &slot,
                         &mut ids,
                     );
+                    tool_names.insert(call_id, name.map(Arc::from));
                 }
             }
         }
@@ -359,6 +415,9 @@ pub fn to_core(body: &Value) -> Converted {
         }
     }
 
+    // The sidecar copy is diagnostic only (no replay path reads it); keep it
+    // as the final wire-order table for parity with the previous field.
+    sidecar.tool_names = tool_names;
     Converted {
         messages: out,
         sidecar,
@@ -369,11 +428,18 @@ fn core_text(message: &KMessage) -> String {
     message.content.text().unwrap_or("").to_string()
 }
 
+/// Text plus a tool result's body. Tool slots must not use `core_text`: the
+/// kernel deliberately keeps `text()` prose-only, so a pruned `ToolResult`
+/// would otherwise rebuild as an empty string and lose the artifact stub.
+fn core_body_text(message: &KMessage) -> String {
+    message.content.body().unwrap_or("").to_string()
+}
+
 fn rebuild_slot(raw: &Value, cores: &[KMessage], sidecar: &Sidecar) -> Value {
     let role = raw.get("role").and_then(Value::as_str).unwrap_or("user");
     if role == "tool" {
         let call_id = raw.get("tool_call_id").cloned().unwrap_or(json!(""));
-        let text: Vec<String> = cores.iter().map(core_text).collect();
+        let text: Vec<String> = cores.iter().map(core_body_text).collect();
         let mut message = json!({
             "role": "tool",
             "tool_call_id": call_id,
@@ -397,11 +463,18 @@ fn rebuild_slot(raw: &Value, cores: &[KMessage], sidecar: &Sidecar) -> Value {
                 call_id,
                 arguments,
             } => {
-                tool_calls.push(json!({
-                    "id": call_id,
+                // Node omits `id` when the wire call had none; null is not the
+                // same wire shape. Empty stays an explicit empty string.
+                let mut call = json!({
                     "type": "function",
-                    "function": {"name": name, "arguments": arguments},
-                }));
+                    // Runtime default only: wire requires a name, identity
+                    // keeps `None` as null.
+                    "function": {"name": if name.is_empty() { "unknown" } else { name }, "arguments": arguments},
+                });
+                if !call_id.is_empty() {
+                    call["id"] = json!(call_id);
+                }
+                tool_calls.push(call);
             }
             KContent::ToolResult { content, .. } => text.push(content.to_string()),
         }
@@ -483,13 +556,15 @@ pub fn from_core(messages: &[KMessage], sidecar: &Sidecar) -> Vec<Value> {
     out
 }
 
-/// Append the kernel nudge to the newest user turn.  A tool round cannot be
-/// interrupted by a fresh `user` message, so merge into the pending user
-/// content instead of emitting a second consecutive user turn.
+/// Append the kernel nudge as the newest user turn, string content (the shape
+/// an OpenAI-compatible gateway forwards without re-parsing part arrays).
 pub fn inject_user_note(body: &mut Value, note: &str) {
     if note.trim().is_empty() {
         return;
     }
+    // A tool round cannot be interrupted by a fresh `user` message, so merge
+    // into the pending user content instead of emitting a second consecutive
+    // user turn.
     if let Some(message) = body
         .get_mut("messages")
         .and_then(Value::as_array_mut)
@@ -565,8 +640,76 @@ fn openai_tool(definition: &Value) -> Value {
     })
 }
 
+fn estimate_message_tokens_inner(message: &Value) -> usize {
+    let mut total = 0usize;
+    let content = message.get("content").unwrap_or(&Value::Null);
+    total += estimate_tokens(&text_of(content));
+    if !content_is_text_only(content) {
+        total += 1000;
+    }
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        total += estimate_tokens(reasoning);
+    }
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            if let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+            {
+                total += estimate_tokens(&arguments_string(arguments));
+            }
+        }
+    }
+    total
+}
+
+/// Conversation payload only; system-role messages are fixed overhead.
+pub fn estimate_message_tokens(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+                .map(estimate_message_tokens_inner)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// System-role messages + tool definitions. Kept separate from the raw
+/// conversation estimate so a fixed preamble cannot masquerade as growth.
+pub fn estimate_fixed_overhead(body: &Value) -> usize {
+    let system: usize = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .map(estimate_message_tokens_inner)
+                .sum()
+        })
+        .unwrap_or(0);
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| serde_json::to_string(tools).ok())
+        .map(|tools| estimate_tokens(&tools))
+        .unwrap_or(0);
+    system + tools
+}
+
 /// Rough request size in the proxy's own estimator: message text, reasoning and
 /// tool arguments.  Media is charged a flat 1000 tokens.
+#[allow(
+    dead_code,
+    reason = "kept for callers that need the whole-wire estimate"
+)]
 pub fn estimate_body_tokens(body: &Value) -> usize {
     let mut total = 0usize;
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
@@ -606,9 +749,358 @@ pub fn estimate_body_tokens(body: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::ArtifactStore;
+    use crate::prune::{PrunePolicy, apply_existing_stubs, prune_tool_results};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// C2-B: upstream's kernel identity cannot represent a missing name, so an
+    /// absent `function.name`/result name normalizes to `""`; a forced rebuild
+    /// (fold or rewrite) needs a wire name and uses `"unknown"` at runtime.
+    #[test]
+    fn absent_tool_name_is_empty_and_rebuild_uses_unknown() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"arguments":"{\"q\":1}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"out"}
+        ]));
+        let converted = to_core(&body);
+        let call = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolCall { .. }))
+            .expect("tool call");
+        assert_eq!(call.content.tool_name(), Some(""));
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        assert_eq!(result.content.tool_name(), Some(""));
+
+        // Change the call so the raw slot can no longer be replayed verbatim,
+        // forcing the rebuild path that needs a runtime name.
+        let mut messages = converted.messages.clone();
+        let call_index = messages
+            .iter()
+            .position(|message| matches!(message.content, KContent::ToolCall { .. }))
+            .unwrap();
+        if let KContent::ToolCall { arguments, .. } = &mut messages[call_index].content {
+            *arguments = "{\"q\":2}".into();
+        }
+        let rebuilt = from_core(&messages, &converted.sidecar);
+        let changed = rebuilt
+            .iter()
+            .flat_map(|message| {
+                message["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .find(|call| call["id"] == "c1")
+            .expect("tool call");
+        assert_eq!(changed["function"]["name"], "unknown");
+    }
+
+    /// An explicit empty name is distinct from the missing state.
+    #[test]
+    fn empty_tool_name_stays_empty() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"out"}
+        ]));
+        let converted = to_core(&body);
+        let call = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolCall { .. }))
+            .expect("tool call");
+        assert_eq!(call.content.tool_name(), Some(""));
+    }
+
+    fn tool_names_in_order(converted: &Converted) -> Vec<Option<&str>> {
+        converted
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                KContent::ToolCall { name, .. } | KContent::ToolResult { name, .. } => {
+                    Some(Some(&**name))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Node learns names in wire order: a tool result before its call sees no
+    /// name, and reloading the rebuilt wire keeps that order.
+    #[test]
+    fn result_before_call_does_not_see_later_name() {
+        let body = body(json!([
+            {"role":"tool","tool_call_id":"c1","content":"out"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}
+            ]}
+        ]));
+        let converted = to_core(&body);
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some(""), Some("Read")]
+        );
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let round = to_core(&body_with_messages(Value::Array(rebuilt)));
+        assert_eq!(tool_names_in_order(&round), vec![Some(""), Some("Read")]);
+    }
+
+    /// A result after its call sees the name learned earlier in the stream.
+    #[test]
+    fn result_after_call_learns_name() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"out"}
+        ]));
+        let converted = to_core(&body);
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some("Read"), Some("Read")]
+        );
+    }
+
+    /// A duplicate call id overwrites the table; each result sees the latest
+    /// call emitted before it, not the last call in the whole request.
+    #[test]
+    fn duplicate_call_id_uses_latest_preceding_name() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"First","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"one"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"Second","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"two"}
+        ]));
+        let converted = to_core(&body);
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![Some("First"), Some("First"), Some("Second"), Some("Second")]
+        );
+    }
+
+    /// OpenAI prefers a non-empty message-level `name`; an empty message name
+    /// falls back to the wire-order table, and an unknown id stays absent.
+    #[test]
+    fn direct_name_wins_and_empty_direct_name_falls_back() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"Mapped","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","name":"Direct","content":"a"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c2","type":"function","function":{"name":"MappedTwo","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c2","name":"","content":"b"},
+            {"role":"tool","tool_call_id":"missing","content":"c"}
+        ]));
+        let converted = to_core(&body);
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![
+                Some("Mapped"),
+                Some("Direct"),
+                Some("MappedTwo"),
+                Some("MappedTwo"),
+                Some("")
+            ]
+        );
+    }
+
+    /// OpenAI normalizes a tool message's missing/null call id to `""`, while
+    /// an assistant call keeps absence as `None`. A missing call can therefore
+    /// never be hit by a result's `""` key; only an explicit empty call can.
+    #[test]
+    fn missing_call_id_does_not_capture_empty_tool_result() {
+        let body = body(json!([
+            {"role":"assistant","content":null,"tool_calls":[
+                {"type":"function","function":{"name":"Missing","arguments":"{}"}}
+            ]},
+            {"role":"tool","content":"a"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"","type":"function","function":{"name":"Empty","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"","content":"b"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"type":"function","function":{"name":"Later","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"","content":"c"}
+        ]));
+        let converted = to_core(&body);
+        assert_eq!(
+            tool_names_in_order(&converted),
+            vec![
+                Some("Missing"),
+                Some(""),
+                Some("Empty"),
+                Some("Empty"),
+                Some("Later"),
+                Some("Empty")
+            ]
+        );
+
+        let call_ids: Vec<Option<&str>> = converted
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                KContent::ToolCall { call_id, .. } | KContent::ToolResult { call_id, .. } => {
+                    Some(Some(&**call_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_ids,
+            vec![Some(""), Some(""), Some(""), Some(""), Some(""), Some(""),]
+        );
+
+        // Persistence preserves absence and empty distinctly.
+        for message in &converted.messages {
+            let round: KMessage =
+                serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+            match (&message.content, &round.content) {
+                (
+                    KContent::ToolCall {
+                        call_id: before, ..
+                    },
+                    KContent::ToolCall { call_id: after, .. },
+                )
+                | (
+                    KContent::ToolResult {
+                        call_id: before, ..
+                    },
+                    KContent::ToolResult { call_id: after, .. },
+                ) => assert_eq!(before, after),
+                _ => {}
+            }
+        }
+
+        // The rebuilt assistant call omits an absent id; empty stays empty.
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let wire_ids: Vec<Option<&Value>> = rebuilt
+            .iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flat_map(|calls| calls.iter())
+            .map(|call| call.get("id"))
+            .collect();
+        assert!(wire_ids[0].is_none());
+        assert_eq!(wire_ids[1].unwrap(), "");
+        assert!(wire_ids[2].is_none());
+    }
+
+    /// Node stringifies an integral float without `.0` and uses a signed
+    /// positive exponent for `>= 1e21`.
+    #[test]
+    fn text_array_float_numbers_use_js_format() {
+        let body = body(json!([
+            {"role":"tool","tool_call_id":"c1","content":[
+                {"type":"text","text":5.0},
+                {"type":"text","text":1e-7},
+                {"type":"text","text":1e21},
+                {"type":"text","text":9007199254740993i64}
+            ]}
+        ]));
+        let converted = to_core(&body);
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "5\n1e-7\n1e+21\n9007199254740992");
+    }
+
+    /// C-1: a non-text part keeps its slot, so a trailing image leaves the
+    /// Node-visible newline after `"x"`.
+    #[test]
+    fn tool_result_text_preserves_non_text_slots() {
+        let body = body(json!([
+            {"role":"tool","tool_call_id":"c1","content":[
+                {"type":"text","text":"x"},
+                {"type":"image_url","image_url":{"url":"https://example.invalid/i.png"}}
+            ]}
+        ]));
+        let converted = to_core(&body);
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "x\n");
+    }
+
+    /// Node's `stringContent` keeps string parts, stringifies scalar `text`
+    /// values, and emits an empty slot for every other part.
+    #[test]
+    fn text_array_preserves_string_parts_and_scalar_text() {
+        let body = body(json!([
+            {"role":"tool","tool_call_id":"c1","content":[
+                "a",
+                {"type":"text","text":"b"},
+                {"type":"image_url","image_url":{"url":"https://example.invalid/i.png"}},
+                {"type":"text","text":5},
+                {"type":"text","text":true},
+                {"type":"text"}
+            ]}
+        ]));
+        let converted = to_core(&body);
+        let result = converted
+            .messages
+            .iter()
+            .find(|message| matches!(message.content, KContent::ToolResult { .. }))
+            .expect("tool result");
+        let text = match &result.content {
+            KContent::ToolResult { content, .. } => content.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "a\nb\n\n5\ntrue\n");
+    }
+
+    fn body_with_messages(messages: Value) -> Value {
+        json!({"model": "gpt", "messages": messages})
+    }
 
     fn body(messages: Value) -> Value {
         json!({"model": "gpt", "messages": messages})
+    }
+
+    fn temp_store(tag: &str) -> (ArtifactStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "bili-openai-{tag}-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ));
+        (ArtifactStore::new(&dir), dir)
+    }
+
+    fn stub_artifact_id(stub: &str) -> String {
+        stub.strip_prefix("[artifact ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("artifact stub")
+            .to_string()
     }
 
     #[test]
@@ -622,6 +1114,54 @@ mod tests {
         assert_eq!(converted.messages.len(), 3);
         let rebuilt = from_core(&converted.messages, &converted.sidecar);
         assert_eq!(Value::Array(rebuilt), body["messages"]);
+    }
+
+    #[test]
+    fn estimates_text_tool_calls_and_tool_results() {
+        let text = body(json!([{"role":"user","content":"hello world"}]));
+        assert!(estimate_body_tokens(&text) > 0);
+
+        let tool_result = body(json!([
+            {"role":"user","content":"read"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"Read","arguments":"{\"path\":\"src/main.rs\"}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"TOOL-RESULT-BODY"}
+        ]));
+        assert!(estimate_body_tokens(&tool_result) > 0);
+        assert!(estimate_message_tokens(&tool_result) > 0);
+
+        let empty = body(json!([{"role":"user","content":""}]));
+        assert_eq!(estimate_body_tokens(&empty), 0);
+    }
+
+    #[test]
+    fn fixed_overhead_is_separate_from_conversation_growth() {
+        let request = json!({
+            "messages":[
+                {"role":"system","content":"fixed system prompt"},
+                {"role":"user","content":"hello"}
+            ],
+            "tools":[{"type":"function","function":{"name":"Read","description":"read","parameters":{}}}]
+        });
+        assert!(estimate_fixed_overhead(&request) > 0);
+        assert!(estimate_message_tokens(&request) > 0);
+        assert_eq!(
+            estimate_body_tokens(&request),
+            estimate_message_tokens(&request) + estimate_fixed_overhead(&request)
+        );
+    }
+
+    #[test]
+    fn fixed_openai_wire_fixture_preserves_tool_result() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/openai-tool-result.json"))
+                .expect("fixture json");
+        let converted = to_core(&fixture);
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let rebuilt_body = json!({"messages": rebuilt, "tools": fixture["tools"]});
+        assert!(rebuilt_body.to_string().contains("FIXTURE-MID"));
+        assert!(estimate_body_tokens(&rebuilt_body) > 0);
     }
 
     #[test]
@@ -669,6 +1209,129 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "compress");
         assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn pruned_tool_result_rebuilds_artifact_stub_and_allows_recovery() {
+        let (store, dir) = temp_store("stub");
+        let raw = format!(
+            "{}OPENAI-MIDDLE-SECRET{}",
+            "OPENAI-HEAD ".repeat(2_000),
+            "OPENAI-TAIL ".repeat(2_000)
+        );
+        let request = body(json!([
+            {"role": "user", "content": "read"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "Read", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": raw.clone()}
+        ]));
+        let mut converted = to_core(&request);
+        let policy = PrunePolicy {
+            enabled: true,
+            min_tokens: 1,
+            ..PrunePolicy::default()
+        };
+        let report = prune_tool_results(
+            &mut converted.messages,
+            20_000,
+            20_000,
+            &HashSet::new(),
+            0,
+            0,
+            Some(&store),
+            &policy,
+            "openai-test",
+        );
+        assert_eq!(report.pruned_items, 1);
+
+        let rebuilt = from_core(&converted.messages, &converted.sidecar);
+        let tool = rebuilt
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .expect("tool message");
+        let stub = tool["content"].as_str().expect("tool content");
+        assert!(stub.starts_with("[artifact "), "{stub}");
+        let artifact_id = stub_artifact_id(stub);
+        assert!(stub.contains(&artifact_id));
+        assert!(
+            !serde_json::to_string(&rebuilt)
+                .unwrap()
+                .contains("OPENAI-MIDDLE-SECRET")
+        );
+
+        let recovered = store.read(&artifact_id, 0, raw.len() as u64).unwrap();
+        assert_eq!(recovered.text, raw);
+        assert_eq!(recovered.byte_len, raw.len() as u64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn raw_resend_reproduces_stub_instead_of_leaking_body() {
+        let (store, dir) = temp_store("resend");
+        let raw = format!(
+            "{}OPENAI-RESEND-MIDDLE-SECRET{}",
+            "OPENAI-RESEND-HEAD ".repeat(2_000),
+            "OPENAI-RESEND-TAIL ".repeat(2_000)
+        );
+        let request = body(json!([
+            {"role": "user", "content": "read"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "Read", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": raw.clone()}
+        ]));
+        let policy = PrunePolicy {
+            enabled: true,
+            min_tokens: 1,
+            ..PrunePolicy::default()
+        };
+        let mut first = to_core(&request);
+        assert_eq!(
+            prune_tool_results(
+                &mut first.messages,
+                20_000,
+                20_000,
+                &HashSet::new(),
+                0,
+                0,
+                Some(&store),
+                &policy,
+                "openai-test"
+            )
+            .pruned_items,
+            1
+        );
+        let first_wire = from_core(&first.messages, &first.sidecar);
+        let stub = first_wire
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("first stub")
+            .to_string();
+
+        let mut resend = to_core(&request);
+        assert_eq!(
+            apply_existing_stubs(&mut resend.messages, &store, &policy),
+            1
+        );
+        let resend_wire = from_core(&resend.messages, &resend.sidecar);
+        let resend_stub = resend_wire
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("resend stub");
+        assert_eq!(resend_stub, stub);
+        assert!(
+            !serde_json::to_string(&resend_wire)
+                .unwrap()
+                .contains("OPENAI-RESEND-MIDDLE-SECRET")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

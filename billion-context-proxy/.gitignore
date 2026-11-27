@@ -1,0 +1,62 @@
+# --- 构建产物 ---------------------------------------------------------------
+target/
+# 本地独立构建目录（本项目曾用 CARGO_TARGET_DIR 指到仓库外，这里兜底）
+/build/
+*.pdb
+*.d
+
+# --- 分发产物与历史二进制 ---------------------------------------------------
+# dist/ 里是打包出的 exe 与多轮 .bak/.pre-*/.running-* 二进制，体积大且可再生
+dist/
+
+# --- 备份文件 ---------------------------------------------------------------
+# 约定：<name>.<reason>.bak / <name>.pre-<phase>.bak / <name>.disabled-<date>
+*.bak
+*.pre-*
+*.disabled-*
+*.running-*
+
+# --- 日志与临时输出 ---------------------------------------------------------
+*.log
+*.err
+*.out
+*.out.txt
+*.err.txt
+/tmp/
+scratch/
+
+# --- 密钥与凭据 -------------------------------------------------------------
+# 本仓库不含凭据文件；这里防止误加。真实凭据放在 ~/.dsh/.credentials.yaml
+# 与 ~/.config/billion-context/billion-context.json，两者都在仓库外。
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*
+*.credentials.yaml
+billion-context.json
+
+# --- 运行期数据 -------------------------------------------------------------
+# 会话快照、产物归档、账本默认写到 ~/.local/state/billion-context；
+# 若用 BILI_SESSIONS_DIR / XDG_* 指到仓库内，下列目录兜底忽略。
+rust-sessions/
+sessions/
+artifacts/
+usage-ledger/
+*.sqlite
+*.sqlite-*
+
+# --- 编辑器与系统 -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# --- 测试夹具 ---------------------------------------------------------------
+# ezxss 根 .gitignore 用 `*.json` 忽略数据文件，这里把测试夹具反选回来，
+# 否则往 tests/fixtures/ 新增的 json 会被静默忽略、提交时凭空消失。
+!tests/fixtures/
+!tests/fixtures/*.json

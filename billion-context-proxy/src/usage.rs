@@ -11,8 +11,10 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::session_store::Store;
+use crate::usage_ledger::{Finish, RequestRecord};
 
 /// Billing numbers for one upstream response.  All counters are cumulative
 /// session totals, so callers add rather than overwrite.
@@ -24,6 +26,94 @@ pub struct Usage {
     /// Total prompt tokens as the provider billed them.  Anthropic reports
     /// cache reads outside `input_tokens`, OpenAI includes them.
     pub context: u32,
+}
+
+/// Which upstream protocol produced the numbers.  The input/cache accounting
+/// differs per protocol, so the ledger keeps the protocol instead of applying
+/// one generic formula.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageProtocol {
+    Anthropic,
+    Openai,
+    Google,
+}
+
+/// One response's provider numbers with absence preserved as `None`.  A field
+/// the provider did not report stays `None`; nothing is substituted with 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageFields {
+    pub input: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_creation: Option<u64>,
+    pub output: Option<u64>,
+    pub protocol: Option<UsageProtocol>,
+    /// True when the response carried a usage object/event at all, even if it
+    /// was empty.  This separates "provider sent nothing" from "provider sent
+    /// an object with fields missing".
+    pub object_present: bool,
+}
+
+impl UsageFields {
+    /// No canonical token number at all for this protocol.
+    pub fn missing_all(&self) -> bool {
+        self.input.is_none()
+            && self.cache_read.is_none()
+            && self.cache_creation.is_none()
+            && self.output.is_none()
+    }
+}
+
+/// Fields the protocol is expected to report.  Used to tell a partial usage
+/// object from a missing one without inventing values.
+pub fn missing_fields(fields: &UsageFields) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if fields.input.is_none() {
+        missing.push("input_tokens");
+    }
+    if fields.cache_read.is_none() {
+        missing.push("cache_read_tokens");
+    }
+    if matches!(fields.protocol, Some(UsageProtocol::Anthropic)) && fields.cache_creation.is_none()
+    {
+        missing.push("cache_creation_tokens");
+    }
+    if fields.output.is_none() {
+        missing.push("output_tokens");
+    }
+    missing
+}
+
+/// Context tokens under a protocol-defined rule only; `None` means the host
+/// has no verified rule for the fields present.
+pub fn context_tokens(fields: &UsageFields) -> (Option<u64>, Option<&'static str>) {
+    match fields.protocol {
+        // Anthropic: `input_tokens` excludes cache reads and cache writes, so
+        // the billed prompt total is the sum of all three reported parts.
+        Some(UsageProtocol::Anthropic) => {
+            match (fields.input, fields.cache_read, fields.cache_creation) {
+                (Some(input), Some(cache_read), Some(cache_creation)) => (
+                    Some(
+                        input
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_creation),
+                    ),
+                    Some("anthropic_input_plus_cache_read_plus_cache_creation"),
+                ),
+                _ => (None, None),
+            }
+        }
+        // OpenAI: `prompt_tokens` already includes cached prompt tokens.
+        Some(UsageProtocol::Openai) => match fields.input {
+            Some(prompt_tokens) => (
+                Some(prompt_tokens),
+                Some("openai_prompt_tokens_includes_cached"),
+            ),
+            None => (None, None),
+        },
+        // Google usageMetadata was not part of this change's verified scope.
+        Some(UsageProtocol::Google) => (None, None),
+        None => (None, None),
+    }
 }
 
 /// One response can split its usage across events; keep the parts separately so
@@ -39,10 +129,15 @@ pub struct Accum {
     openai: bool,
     anthropic: bool,
     google: bool,
+    /// Set when the response carried a usage object/event, even an empty one.
+    usage_object_present: bool,
 }
 
 impl Accum {
     fn absorb(&mut self, value: &Value) {
+        if value.get("usage").is_some() || value.get("usageMetadata").is_some() {
+            self.usage_object_present = true;
+        }
         if let Some(usage) = value.get("usage") {
             self.absorb_anthropic(usage);
         }
@@ -51,6 +146,7 @@ impl Accum {
                 self.model = Some(model.to_string());
             }
             if let Some(usage) = message.get("usage") {
+                self.usage_object_present = true;
                 self.absorb_anthropic(usage);
             }
         }
@@ -138,8 +234,35 @@ impl Accum {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "usage model accessor retained for ledger integrations"
+    )]
     pub fn model(&self) -> Option<String> {
         self.model.clone()
+    }
+
+    /// Per-request view: absence preserved and the protocol identified, so the
+    /// ledger can apply the provider's own accounting instead of a generic
+    /// formula.
+    pub fn fields(&self) -> UsageFields {
+        let protocol = if self.anthropic {
+            Some(UsageProtocol::Anthropic)
+        } else if self.openai {
+            Some(UsageProtocol::Openai)
+        } else if self.google {
+            Some(UsageProtocol::Google)
+        } else {
+            None
+        };
+        UsageFields {
+            input: self.input,
+            cache_read: self.cached,
+            cache_creation: self.creation,
+            output: self.output,
+            protocol,
+            object_present: self.usage_object_present,
+        }
     }
 }
 
@@ -151,7 +274,7 @@ pub fn absorb_json(acc: &mut Accum, text: &str) {
     acc.absorb(&value);
 }
 
-/// Feed complete lines of an SSE stream into the accumulator.  Returns true
+/// Feed complete lines of an SSE stream into the accumulator. Returns true
 /// once a terminal frame (`data: [DONE]` or Anthropic `message_stop`) has been
 /// seen, so the caller can persist billed usage before the client disconnects.
 pub fn absorb_sse_lines(acc: &mut Accum, buffer: &mut String, chunk: &str) -> bool {
@@ -178,51 +301,98 @@ pub fn absorb_sse_lines(acc: &mut Accum, buffer: &mut String, chunk: &str) -> bo
 }
 
 /// Tee an upstream response body through the usage parser.  Bytes are yielded
-/// unchanged and in order; recording happens at end of stream (or as soon as a
-/// terminal usage event completes the record, so a dropped connection still
-/// leaves the numbers behind).
-pub fn inspect_stream<S>(
+/// unchanged and in order.  A dropped connection records the numbers that did
+/// arrive before the error is propagated, so a truncated response can never be
+/// mistaken for a complete one.
+pub fn inspect_stream<S, E>(
     stream: S,
     content_type: String,
     store: Store,
     key: String,
     fallback_model: Option<String>,
-) -> impl Stream<Item = Result<Bytes, reqwest::Error>>
+    ledger: Option<RequestRecord>,
+) -> impl Stream<Item = Result<Bytes, E>>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     try_stream! {
         let mut acc = Accum::default();
         let mut buffer = String::new();
         let mut body = String::new();
-        let mut recorded = false;
         let sse = content_type.contains("text/event-stream");
         let json = content_type.contains("application/json");
+        // The hash covers the bytes actually received, in arrival order.  It is
+        // an integrity check, not an archive: the host does not persist the
+        // raw response body.
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let mut recorded = false;
         let mut stream = stream;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if sse || json {
-                let text = String::from_utf8_lossy(&chunk);
-                if sse {
-                    let terminal = absorb_sse_lines(&mut acc, &mut buffer, &text);
-                    if terminal && !recorded {
-                        if let Some(usage) = acc.finish() {
-                            store.record_usage(&key, fallback_model.as_deref(), usage);
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    hasher.update(&chunk);
+                    received = received.saturating_add(chunk.len() as u64);
+                    if sse || json {
+                        let text = String::from_utf8_lossy(&chunk);
+                        if sse {
+                            let terminal = absorb_sse_lines(&mut acc, &mut buffer, &text);
+                            if terminal && !recorded {
+                                // A terminal frame proves the upstream finished
+                                // billing even if the transport closes later.
+                                if let Some(usage) = acc.finish() {
+                                    store.record_usage(&key, fallback_model.as_deref(), usage);
+                                }
+                                if let Some(record) = ledger.as_ref() {
+                                    let digest = hex::encode(hasher.clone().finalize());
+                                    if let Err(write_err) = record.finish(Finish::success(
+                                        acc.fields(),
+                                        digest,
+                                        received,
+                                    )) {
+                                        eprintln!(
+                                            "[billion-context-proxy] usage ledger write failed: {write_err}"
+                                        );
+                                    }
+                                }
+                                recorded = true;
+                            }
+                        } else if body.len() < 8 * 1024 * 1024 {
+                            body.push_str(&text);
                         }
-                        recorded = true;
                     }
-                } else if body.len() < 8 * 1024 * 1024 {
-                    body.push_str(&text);
+                    yield chunk;
                 }
+                Some(Err(err)) => {
+                    let digest = hex::encode(hasher.clone().finalize());
+                    if !recorded {
+                        if let Some(record) = ledger.as_ref() {
+                            if let Err(write_err) = record
+                                .finish(Finish::stream_error(acc.fields(), digest, received))
+                            {
+                                eprintln!("[billion-context-proxy] usage ledger write failed: {write_err}");
+                            }
+                        }
+                    }
+                    Err(err)?;
+                }
+                None => break,
             }
-            yield chunk;
         }
         if !recorded {
             if !sse && json && !body.is_empty() {
                 absorb_json(&mut acc, &body);
             }
+            let digest = hex::encode(hasher.finalize());
+            let fields = acc.fields();
             if let Some(usage) = acc.finish() {
                 store.record_usage(&key, fallback_model.as_deref(), usage);
+            }
+            if let Some(record) = ledger.as_ref() {
+                if let Err(write_err) = record.finish(Finish::success(fields, digest, received)) {
+                    eprintln!("[billion-context-proxy] usage ledger write failed: {write_err}");
+                }
             }
         }
     }
@@ -301,5 +471,224 @@ mod tests {
         assert_eq!(usage.input, 10);
         assert_eq!(usage.cached, 80);
         assert_eq!(usage.output, 5);
+    }
+
+    #[test]
+    fn partial_anthropic_usage_keeps_missing_fields_null_and_context_null() {
+        let acc = feed(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+        let fields = acc.fields();
+        assert_eq!(fields.input, Some(10));
+        assert_eq!(fields.cache_read, None);
+        assert_eq!(fields.cache_creation, None);
+        assert_eq!(fields.output, None);
+        assert_eq!(fields.protocol, Some(UsageProtocol::Anthropic));
+        // No verified rule for a partial anthropic object.
+        assert_eq!(context_tokens(&fields), (None, None));
+        assert!(!fields.missing_all());
+    }
+
+    #[test]
+    fn context_tokens_follow_the_protocol_rule_per_provider() {
+        let anthropic = UsageFields {
+            input: Some(10),
+            cache_read: Some(80),
+            cache_creation: Some(10),
+            output: Some(5),
+            protocol: Some(UsageProtocol::Anthropic),
+            object_present: true,
+        };
+        assert_eq!(
+            context_tokens(&anthropic),
+            (
+                Some(100),
+                Some("anthropic_input_plus_cache_read_plus_cache_creation")
+            )
+        );
+        let openai = UsageFields {
+            input: Some(100),
+            cache_read: Some(40),
+            cache_creation: None,
+            output: Some(5),
+            protocol: Some(UsageProtocol::Openai),
+            object_present: true,
+        };
+        assert_eq!(
+            context_tokens(&openai),
+            (Some(100), Some("openai_prompt_tokens_includes_cached"))
+        );
+        let google = UsageFields {
+            input: Some(100),
+            cache_read: Some(40),
+            cache_creation: None,
+            output: Some(5),
+            protocol: Some(UsageProtocol::Google),
+            object_present: true,
+        };
+        // Not part of this change's verified scope; must stay unset.
+        assert_eq!(context_tokens(&google), (None, None));
+    }
+
+    #[test]
+    fn empty_usage_object_reports_no_numbers_without_zero_fill() {
+        let acc = feed(&[r#"data: {"usage":{}}"#]);
+        let fields = acc.fields();
+        assert!(fields.object_present);
+        assert!(fields.missing_all());
+        assert_eq!(fields.input, None);
+        assert_eq!(fields.output, None);
+        assert_eq!(context_tokens(&fields), (None, None));
+    }
+
+    fn ledger_test_record(root: &std::path::Path) -> RequestRecord {
+        let requests = root.join("requests");
+        let headers = axum::http::HeaderMap::new();
+        RequestRecord::new(
+            crate::usage_ledger::ledger_path(&requests, "usage-test"),
+            "usage-test",
+            "anthropic",
+            Some("mock-model".into()),
+            "http://127.0.0.1:9/v1/messages",
+            crate::usage_ledger::UsageSource::Mock,
+            "loopback_upstream",
+            crate::session_store::now_ms(),
+            crate::usage_ledger::sha256_hex(b"request"),
+            7,
+            true,
+            None,
+            &headers,
+        )
+    }
+
+    fn read_ledger(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("ledger json"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn completed_stream_records_the_hash_of_received_bytes() {
+        let root = std::env::temp_dir().join(format!("bili-usage-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let store = Store::with_dir(root.join("sessions"));
+        let record = ledger_test_record(&root);
+        record.start().expect("start");
+        let chunks = vec![
+            Bytes::from_static(
+                b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10}}}\n\n",
+            ),
+            Bytes::from_static(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n"),
+        ];
+        let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        let tee = inspect_stream(
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)),
+            "text/event-stream".to_string(),
+            store,
+            "usage-test".to_string(),
+            Some("mock-model".to_string()),
+            Some(record.clone()),
+        );
+        let received: Vec<Bytes> = tee.map(|item| item.expect("response byte")).collect().await;
+        let received: Vec<u8> = received.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        assert_eq!(received, expected);
+
+        let lines = read_ledger(record.path());
+        let finish = lines.last().expect("finish line");
+        assert_eq!(finish["status"], "success");
+        assert_eq!(
+            finish["response_hash"],
+            crate::usage_ledger::sha256_hex(&expected)
+        );
+        assert_eq!(finish["response_bytes"], expected.len() as u64);
+        assert_eq!(finish["usage_object_present"], true);
+        assert_eq!(finish["input_tokens"], 10);
+        assert_eq!(finish["cache_read_tokens"], 80);
+        assert_eq!(finish["cache_creation_tokens"], 10);
+        assert_eq!(finish["output_tokens"], 5);
+        assert_eq!(finish["context_tokens"], 100);
+    }
+
+    #[derive(Debug)]
+    struct TruncatedStream;
+
+    impl std::fmt::Display for TruncatedStream {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "truncated upstream stream")
+        }
+    }
+
+    impl std::error::Error for TruncatedStream {}
+
+    #[tokio::test]
+    async fn dropped_stream_leaves_only_the_start_line() {
+        // A client abort or host exit drops the tee before it reaches its end:
+        // the ledger must then show a start with no finish, never a success.
+        let root =
+            std::env::temp_dir().join(format!("bili-usage-stream-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let store = Store::with_dir(root.join("sessions"));
+        let record = ledger_test_record(&root);
+        record.start().expect("start");
+        let chunk = Bytes::from_static(b"data: {\"type\":\"content_block_delta\"}\n\n");
+        let mut tee = Box::pin(inspect_stream(
+            futures_util::stream::iter(vec![Ok::<_, TruncatedStream>(chunk)]),
+            "text/event-stream".to_string(),
+            store,
+            "usage-test".to_string(),
+            None,
+            Some(record.clone()),
+        ));
+        assert!(tee.next().await.is_some());
+        drop(tee);
+
+        let lines = read_ledger(record.path());
+        assert_eq!(lines.len(), 1, "only the start line was written");
+        assert_eq!(lines[0]["event"], "start");
+        assert_eq!(lines[0]["status"], serde_json::Value::Null);
+        assert_eq!(lines[0]["finished_at"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_records_partial_hash_then_reports_the_error() {
+        let root =
+            std::env::temp_dir().join(format!("bili-usage-stream-err-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let store = Store::with_dir(root.join("sessions"));
+        let record = ledger_test_record(&root);
+        record.start().expect("start");
+        let partial: &[u8] =
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n";
+        let items: Vec<Result<Bytes, TruncatedStream>> =
+            vec![Ok(Bytes::from_static(partial)), Err(TruncatedStream)];
+        let tee = inspect_stream(
+            futures_util::stream::iter(items.into_iter()),
+            "text/event-stream".to_string(),
+            store,
+            "usage-test".to_string(),
+            None,
+            Some(record.clone()),
+        );
+        let results: Vec<Result<Bytes, TruncatedStream>> = tee.collect().await;
+        assert_eq!(results.len(), 2, "both the bytes and the error surface");
+        assert!(results[0].is_ok(), "received bytes are passed through");
+        assert!(results[1].is_err(), "the interruption is not swallowed");
+
+        let lines = read_ledger(record.path());
+        let finish = lines.last().expect("finish line");
+        assert_eq!(finish["status"], "stream_error");
+        assert_eq!(finish["response_complete"], false);
+        assert_eq!(
+            finish["response_hash"],
+            crate::usage_ledger::sha256_hex(partial)
+        );
+        assert_eq!(finish["response_bytes"], partial.len() as u64);
+        assert_eq!(finish["input_tokens"], 10);
+        assert_eq!(finish["output_tokens"], serde_json::Value::Null);
+        assert_eq!(finish["usage_from_complete_stream"], false);
     }
 }
