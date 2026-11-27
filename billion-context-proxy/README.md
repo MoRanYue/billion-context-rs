@@ -34,8 +34,9 @@ target\release\billion-context-proxy.exe start --port 18113 --debug
 
 - 默认只绑定回环地址；绑定非回环地址必须显式 `--allow-remote-bind`（或
   `BILI_ALLOW_REMOTE_BIND=1`），启动时会打印警告。
-- `/__bili/*` 管理面要求回环 `Host`；浏览器 `Origin` 只接受回环来源或
-  `BILI_ADMIN_ORIGINS`（逗号分隔），CORS 不再回 `*`。
+- `/__bili/*` 管理面要求回环 `Host` 和回环 peer；即使绑定非回环地址，远程连接也
+  不能访问管理面。浏览器 `Origin` 只接受回环来源或 `BILI_ADMIN_ORIGINS`（逗号
+  分隔），CORS 不再回 `*`。
 - 设置 `BILI_LAUNCH_TOKEN` 时，管理写操作（非 GET/HEAD/OPTIONS）必须携带
   `x-bili-launch-token` 或 `Authorization: Bearer <token>`；插件工具车道与
   watcher 心跳豁免，避免压缩调用和生命周期心跳被令牌卡住。Node 启动器会注入
