@@ -784,13 +784,11 @@ async fn forward_handler(
         );
     }
 
+    let model_wire = target_has_model_wire(&target);
     let mut forward = HeaderMap::new();
     for (name, value) in headers.iter() {
         let n = name.as_str().to_ascii_lowercase();
-        if matches!(
-            n.as_str(),
-            "host" | "connection" | "content-length" | "transfer-encoding" | "expect" | "upgrade"
-        ) {
+        if !request_header_is_forwardable(&n, model_wire) {
             continue;
         }
         forward.insert(name, value.clone());
@@ -1354,6 +1352,23 @@ fn maybe_prepare(
 
 fn target_has_model_wire(target: &str) -> bool {
     target.contains("/v1/messages") || target.contains("/chat/completions")
+}
+
+/// Whether a client request header may be copied onto the upstream request.
+///
+/// `accept-encoding` is dropped for model wires: the usage tee parses the
+/// response bytes it forwards, and a compressed body (gzip/brotli/zstd) would
+/// hide the `usage` object from the parser, silently zeroing the billing
+/// counters. The upstream then answers with identity encoding, which every
+/// client accepts; the cost is bandwidth on this loopback hop only.
+fn request_header_is_forwardable(name: &str, model_wire: bool) -> bool {
+    if matches!(
+        name,
+        "host" | "connection" | "content-length" | "transfer-encoding" | "expect" | "upgrade"
+    ) {
+        return false;
+    }
+    !(model_wire && name == "accept-encoding")
 }
 
 /// Origin kept for host-owned metadata: scheme, host and port only.
@@ -2875,6 +2890,15 @@ mod guard_tests {
             &allowlist,
             false
         ));
+    }
+
+    #[test]
+    fn model_wires_force_identity_encoding() {
+        assert!(!request_header_is_forwardable("accept-encoding", true));
+        assert!(request_header_is_forwardable("accept-encoding", false));
+        assert!(request_header_is_forwardable("authorization", true));
+        assert!(!request_header_is_forwardable("host", false));
+        assert!(!request_header_is_forwardable("content-length", true));
     }
 
     #[test]
