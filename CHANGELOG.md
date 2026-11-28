@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.7.0 — 2026-11-28
+
+### Added
+
+- **Per-call summary ceiling.** `Session::apply_compression_with_summary_limit`
+  applies a `CompressRequest` with a temporarily raised
+  `compress.max_summary_length` and restores the previous value afterwards, so a
+  host can ask for one longer summary without mutating session state. Test:
+  `a_per_call_summary_ceiling_is_restored_after_one_apply`.
+
+- **Artifact stubs survive truncation.** `pipeline::ARTIFACT_STUB_PREFIX` marks
+  the host's `[artifact …]` handles; `EmergencyTruncate` and the regular
+  truncate path skip them, so a hard truncation cannot cut the only handle back
+  to the original payload.
+
+### Changed
+
+- Truncation now walks past artifact stubs instead of counting them as ordinary
+  text. Only host-produced stubs are affected; no wire or IR type changed.
+
+### Notes
+
+- `billion-context-wire` 0.2.1 is unchanged and is skipped by the release flow.
+- `billion-context-tool` 0.7.0 follows the workspace version; only its
+  `billion-context` requirement moved.
+- First crates.io release of `billion-context-proxy` 0.1.0, the optional
+  OpenAI/Anthropic host. Install with `cargo install billion-context-proxy`.
+
+### Verification
+
+- `cargo test --workspace` green (kernel 82 + estimator 4 + media 8 + tool 18 +
+  wire 17 + proxy 326; doctests included).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- Four feature combinations (default, `serde`, `hf-tokenizer`, both) green in CI.
+
 ## 0.6.0 — 2026-11-11
 
 ### Added

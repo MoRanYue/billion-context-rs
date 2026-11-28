@@ -11,12 +11,26 @@ Messages 的请求接入同一 workspace 的 `billion-context` 内核，按折�
 | 版本 | 载体 | 含义 |
 | --- | --- | --- |
 | `0.1.216` | npm 包 `billion-context`（TypeScript 项目） | 上游 Node 端发行版本，与 Rust 侧无关 |
-| `0.6.0` | 本仓库 `[workspace.package]`，由 `billion-context` 等 crate 继承 | Rust 移植的 workspace 版本 |
-| `0.1.217` | `[package] billion-context-proxy` | **本地内部发布流水号**，未发布到任何 registry |
+| `0.7.0` | 本仓库 `[workspace.package]`，由 `billion-context` 等 crate 继承 | Rust 移植的 workspace 版本 |
+| `0.1.0` | `[package] billion-context-proxy` | 本 crate 的首个 crates.io 版本 |
 
-`billion-context-proxy 0.1.217` 不代表上游已发布过 0.1.217 —— npm 的
-`billion-context` 停在 `0.1.216`，crates.io 上也没有 `billion-context-proxy`。
-它只用于标识本机构建的二进制身份。
+`billion-context-proxy 0.1.0` 不跟随 workspace 版本走：它是宿主二进制，按自己的
+节奏发布，但每次发版都会把对 `billion-context` / `billion-context-tool` 的依赖要求
+钉到当时已发布的那一版。
+
+## 安装
+
+```bash
+cargo install billion-context-proxy
+```
+
+从源码仓库安装：
+
+```bash
+cargo install --path billion-context-proxy
+```
+
+安装后直接运行 `billion-context-proxy`；默认监听 `127.0.0.1:18787`。
 
 ## 构建与运行
 

@@ -102,7 +102,7 @@ jobs:
           failed=0
           # Dependency order: the tool crate depends on the kernel, so a version
           # of each must be live before the next is packaged.
-          for pkg in billion-context-wire billion-context billion-context-tool; do
+          for pkg in billion-context-wire billion-context billion-context-tool billion-context-proxy; do
             ver=$(cargo metadata --format-version 1 --no-deps \
               | jq -r --arg p "$pkg" '.packages[] | select(.name == $p) | .version')
             if [ -z "$ver" ] || [ "$ver" = "null" ]; then

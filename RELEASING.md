@@ -1,8 +1,9 @@
 # Releasing
 
-Three crates version independently (the kernel and the tool forward to the
-workspace version, the wire crate has its own), so there is no per-tag version
-to read. A release is: bump what changed, push a tag, let
+Four crates are released from this workspace. The kernel and the tool forward to
+the workspace version, the wire crate has its own, and the proxy host has its
+own, so there is no per-tag version to read. A release is: bump what changed,
+push a tag, let
 [`.github/workflows/release.yml`](.github/workflows/release.yml) publish
 whatever the index does not already have.
 
@@ -22,7 +23,7 @@ skipped.
 
 ## One-time crates.io setup
 
-Trusted Publishing is configured per crate, so this is done three times:
+Trusted Publishing is configured per crate, so this is done four times:
 **Crate → Settings → Trusted Publishing → Add → GitHub**
 
 | Field | Value |
@@ -78,7 +79,7 @@ finishing the rest.
 gh workflow run release.yml -f dry_run=true
 ```
 
-Packages and verifies all three crates — including ones already on the index,
+Packages and verifies all four crates — including ones already on the index,
 which a real run would skip — and uploads nothing. The dry run also skips the
 crates.io authentication step, so it works *before* any Trusted Publisher is
 configured; that order is the point: validate the packaging first, then turn on

@@ -46,7 +46,7 @@ impl BuildInfo {
         }
     }
 
-    /// Render as a short human line: `0.1.217 (3fc289e589b9, release)`.
+    /// Render as a short human line: `0.1.0 (3fc289e589b9, release)`.
     ///
     /// A dirty build is marked so it can never be mistaken for a clean release.
     pub fn summary(&self) -> String {
